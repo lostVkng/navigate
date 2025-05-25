@@ -2,9 +2,11 @@
 name = "navigate"
 version = "0.1.0"
 authors = ["Tom Jones <tomfjones8@gmail.com>"]
-license = "MIT"
 description = "Navigation modules in Rust"
+readme = "README.md"
 edition = "2024"
+repository = "https://github.com/lostVkng/navigate"
+license = "MIT"
 
 [dependencies]
 num-traits = "0.2.19"
