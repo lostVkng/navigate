@@ -1,6 +1,6 @@
 [package]
 name = "navigate"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Tom Jones <tomfjones8@gmail.com>"]
 description = "Navigation modules in Rust"
 readme = "README.md"
@@ -12,3 +12,5 @@ license = "MIT"
 num-traits = "0.2.19"
 rustc-hash = "2.1.1"
 indexmap = "2.9.0"
+rand = "0.9.1"
+kdtree = "0.7.0"
