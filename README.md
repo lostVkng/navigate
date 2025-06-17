@@ -105,7 +105,7 @@ fn main() {
 ```
 
 Example RRT* visualization:
-![RRT* Visualization](https://raw.githubusercontent.com/vkng/navigate/main/assets/rrt_star_path.png)
+![RRT* Visualization](https://raw.githubusercontent.com/lostVkng/navigate/main/assets/rrt_star_path.png)
 
 
 ## Algorithms
