@@ -1,12 +1,15 @@
 [package]
 name = "navigate"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Tom Jones <tomfjones8@gmail.com>"]
-description = "Navigation modules in Rust"
+description = "Search, sampling, grid, and car-like planning and control algorithms"
 readme = "README.md"
 edition = "2024"
+rust-version = "1.85"
 repository = "https://github.com/lostVkng/navigate"
 license = "MIT"
+keywords = ["robotics", "path-planning", "navigation", "astar", "control"]
+categories = ["algorithms", "science::robotics"]
 
 [dependencies]
 num-traits = "0.2.19"
@@ -14,3 +17,16 @@ rustc-hash = "2.1.1"
 indexmap = "2.9.0"
 rand = "0.9.1"
 kdtree = "0.7.0"
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+# Parallel rollout evaluation for the model-predictive path-integral controller.
+rayon = ["dep:rayon"]
+
+[[bench]]
+name = "planners"
+harness = false

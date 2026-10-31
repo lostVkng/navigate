@@ -1,384 +1,531 @@
-use crate::geometry::{Point, Polygon, euclidean};
-use crate::errors::PathPlannerError;
-use std::collections::{HashSet, VecDeque};
+//! RRT\* (Karaman and Frazzoli, *International Journal of Robotics Research*, 2011).
+//!
+//! The tree grows by sampling a point, steering from the nearest vertex by at
+//! most `max_step_size`, and connecting the new vertex to the cheapest
+//! collision-free neighbor inside `neighbor_radius`. Existing neighbors are
+//! then rewired when the new vertex offers them a cheaper path.
+//!
+//! Rewiring updates a vertex and then only the vertices that descend from it.
+//! Each vertex stores its children, so that walk is proportional to the
+//! subtree rather than to the whole tree. Reported distances from the spatial
+//! index are squared Euclidean; every length used for a cost is recomputed
+//! with [`euclidean`].
+//!
+//! The search writes nothing to stdout. Pass [`RRTStar::with_seed`] for a
+//! reproducible sample sequence.
 
-use kdtree::KdTree; // TODO: move off kdtree - issue with within queries distances
+use std::collections::VecDeque;
+
+use kdtree::KdTree;
 use kdtree::distance::squared_euclidean as kt_squared_euclidean;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
+use crate::errors::PathPlannerError;
+use crate::geometry::{Point, Polygon, euclidean};
 
-/// Temporary map struct - may move to separate module
-/// Used to store the space for RRT*
+/// Axis-aligned world with polygonal obstacles, used by [`RRTStar`].
+#[derive(Clone, Debug)]
 pub struct Map {
+    /// Obstacle polygons. A sample is rejected when it lies inside one or when
+    /// the segment that reaches it crosses one.
     pub obstacles: Vec<Polygon>,
+    /// Inclusive minimum and maximum corners of the sample domain.
     pub bounds: (Point, Point),
 }
 
 impl Map {
-
+    /// An empty map covering `bounds`.
     pub fn new(bounds: (Point, Point)) -> Self {
         Self {
-            obstacles: vec![],
-            bounds: bounds
+            obstacles: Vec::new(),
+            bounds,
         }
     }
 
-    /// add obstacles
+    /// Replace the obstacle list.
     pub fn set_obstacles(&mut self, obstacles: Vec<Polygon>) {
         self.obstacles = obstacles;
     }
+
+    /// `true` when `point` lies inside the bounds.
+    pub fn in_bounds(&self, point: Point) -> bool {
+        point.x >= self.bounds.0.x
+            && point.x <= self.bounds.1.x
+            && point.y >= self.bounds.0.y
+            && point.y <= self.bounds.1.y
+    }
+
+    /// `true` when both endpoints are inside the bounds and outside every
+    /// obstacle, and the segment does not cross an obstacle edge.
+    pub fn segment_free(&self, start: Point, end: Point) -> bool {
+        if !self.in_bounds(start) || !self.in_bounds(end) {
+            return false;
+        }
+        for obstacle in &self.obstacles {
+            if obstacle.contains(&start)
+                || obstacle.contains(&end)
+                || obstacle.line_intersects(&start, &end)
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
-
-/// Helper node for storing Point data on the tree
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct Node {
-    pub point: Point,
-    pub cost: f64, // total end to end cost of the path (euclidian distance) - used for rewiring
-    pub parent_idx: Option<usize>, // Index of the parent node
+    point: Point,
+    cost: f64,
+    parent: Option<usize>,
 }
 
+enum Sampler {
+    Thread,
+    Seeded(Box<StdRng>),
+}
 
-/// RRT* Algorithm
-/// http://roboticsproceedings.org/rss06/p34.pdf
+/// Asymptotically optimal sampling-based planner for a point robot.
 pub struct RRTStar<'a> {
-    nodes: Vec<Node>, // visited nodes
-    tree: KdTree<f64, usize, [f64; 2]>, // stores point -> index in nodes
+    nodes: Vec<Node>,
+    children: Vec<Vec<usize>>,
+    tree: KdTree<f64, usize, [f64; 2]>,
     map: Map,
-    start_point: Point,
+    start: Point,
     goal_fn: Box<dyn Fn(&Point) -> bool + 'a>,
     max_step_size: f64,
     neighbor_radius: f64,
     max_iterations: usize,
-    goal_node_idxs: HashSet<usize>,
+    goals: Vec<usize>,
+    sampler: Sampler,
 }
 
 impl<'a> RRTStar<'a> {
-    
-    /// Create a new RRT* instance
-    pub fn new<G>(map: Map, start: Point, goal_fn: G, max_step_size: f64, neighbor_radius: f64, max_iterations: usize) -> Self
-    where G: Fn(&Point) -> bool + 'a,
+    /// Build a tree rooted at `start`.
+    ///
+    /// `goal_fn` reports whether a vertex is close enough to count as a goal.
+    /// `max_step_size` limits the steer. `neighbor_radius` is the rewiring
+    /// radius in meters. `max_iterations` is the number of samples drawn.
+    ///
+    /// The sample stream uses the thread-local generator until
+    /// [`Self::with_seed`] replaces it.
+    pub fn new<G>(
+        map: Map,
+        start: Point,
+        goal_fn: G,
+        max_step_size: f64,
+        neighbor_radius: f64,
+        max_iterations: usize,
+    ) -> Self
+    where
+        G: Fn(&Point) -> bool + 'a,
     {
-
-        // Add start node to nodes_map
-        let mut nodes = Vec::new();
-        nodes.push(Node {
-            point: start.clone(),
+        let nodes = vec![Node {
+            point: start,
             cost: 0.0,
-            parent_idx: None,
-        });
-
-        // Tree is used to store points and find nearest neighbors
+            parent: None,
+        }];
         let mut tree = KdTree::new(2);
-        tree.add([start.x, start.y], 0).unwrap(); // should not fail
-
+        // A two-dimensional tree cannot reject a two-dimensional point.
+        let _ = tree.add([start.x, start.y], 0);
         Self {
             nodes,
+            children: vec![Vec::new()],
             tree,
             map,
-            start_point: start.clone(),
+            start,
             goal_fn: Box::new(goal_fn),
-            max_step_size,
-            neighbor_radius,
+            max_step_size: max_step_size.max(0.0),
+            neighbor_radius: neighbor_radius.max(0.0),
             max_iterations,
-            goal_node_idxs: HashSet::new(),
+            goals: Vec::new(),
+            sampler: Sampler::Thread,
         }
     }
 
-    /// Get all visited points
+    /// Draw later samples from a deterministic generator.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.sampler = Sampler::Seeded(Box::new(StdRng::seed_from_u64(seed)));
+        self
+    }
+
+    /// Every vertex currently in the tree, in insertion order.
     pub fn get_visited_points(&self) -> Vec<Point> {
-        self.nodes.iter().map(|node| node.point.clone()).collect()
+        self.nodes.iter().map(|node| node.point).collect()
     }
 
-    /// Get all edges
+    /// Tree edges as `(child, parent)` pairs. The root is omitted.
     pub fn get_edges(&self) -> Vec<(Point, Point)> {
-        self.nodes.iter().map(|node| {
-            match node.parent_idx {
-                Some(parent_idx) => {
-                    (node.point.clone(), self.nodes[parent_idx].point.clone())
-                },
-                None => (self.start_point.clone(), node.point.clone())
-            }
-        }).collect()
+        self.nodes
+            .iter()
+            .filter_map(|node| {
+                node.parent
+                    .map(|parent| (node.point, self.nodes[parent].point))
+            })
+            .collect()
     }
 
-    /// Get Neighbors nodes based on a point
-    /// Filters out any nodes that are obstructed by an obstacle
-    /// Returns a vec of (index, euclidean distance, node)
-    fn get_neighbors(&self, point: &Point) -> Result<Vec<(usize, f64, Node)>, PathPlannerError> {
-
-        // tree uses squared euclidean distances, so we need to square the radius
-        match self.tree.within(&[point.x, point.y], self.neighbor_radius.powi(2), &kt_squared_euclidean) {
-            Ok(res) => {
-                let mut neighbors: Vec<(usize, f64, Node)> = Vec::new();
-                for (_dist, node_idx) in res {
-
-                    let idx = node_idx.clone();
-                    let node = self.nodes[idx].clone();
-
-                    // NOTE: kdtree seems to be reporting distances incorrectly, may need to migrate
-                    // Calculate the actual Euclidean distance
-                    let actual_distance = euclidean(
-                        point.x, point.y, 
-                        node.point.x, node.point.y
-                    );
-                    // filter points with distance > max step size
-                    if actual_distance > self.max_step_size {
-                        continue;
-                    }
-
-                    // check that no obstacles obstruct path
-                    if !self.is_obstacle_free(&node.point, point) {
-                        continue;
-                    }
-
-                    // Use the directly calculated Euclidean distance
-                    neighbors.push((idx, actual_distance, node));
-                }
-                Ok(neighbors)
-            },
-            Err(e) => return Err(PathPlannerError::KdTreeError(e.to_string())),
-        }
-    }
-
-    /// Get the closest and next point based on max step size and steering
-    fn new_point_step(&self, random_point: &Point) -> Result<(Point, Point), PathPlannerError> {
-        
-        let closest_point: Vec<(f64, &usize)> = self.tree.nearest(&[random_point.x, random_point.y], 1, &kt_squared_euclidean)?;
-        if closest_point.len() != 1 {
-            return Err(PathPlannerError::NoValidPointFound);
-        }
-        let closest_node_idx: usize = closest_point[0].1.clone();
-        let closest_node: Node = self.nodes[closest_node_idx].clone();
-
-        // steer towards the closest point
-        // this is to ensure the point is within step distance of the 'edge' of the tree
-        let new_point: Point = self.steer(&closest_node.point, random_point);
-
-        Ok((closest_node.point, new_point))
-    }
-
-    /// Get all dependent nodes based on a node
-    fn get_dependent_nodes(&self, node_idx: usize) -> Vec<usize> {
-        let mut dependent_nodes: Vec<usize> = Vec::new();
-        for (idx, node) in self.nodes.iter().enumerate() {
-            if node.parent_idx == Some(node_idx) {
-                dependent_nodes.push(idx);
-            }
-        }
-        dependent_nodes
-    }
-
-    /// Update dependent nodes costs if a dependent node's cost decreases
-    fn update_dependent_nodes_costs(&mut self, node_idx: usize) -> Result<(), PathPlannerError> {
-
-        // start with dependent nodes of this node
-        let mut nodes_to_update: VecDeque<usize> = VecDeque::from([node_idx]);
-        
-        while let Some(current_idx) = nodes_to_update.pop_front() {
-
-            // get current node
-            let mut current_node = self.nodes[current_idx].clone();
-
-            // Get the parent of the current node
-            if let Some(parent_idx) = current_node.parent_idx {
-                let parent_node = &self.nodes[parent_idx];
-                let new_cost = parent_node.cost + euclidean(
-                    current_node.point.x, 
-                    current_node.point.y, 
-                    parent_node.point.x, 
-                    parent_node.point.y
-                );
-                current_node.cost = new_cost;
-            }
-
-            self.nodes[current_idx] = current_node;
-
-            // Get all dependent nodes of the current node
-            let dependent_nodes = self.get_dependent_nodes(current_idx);
-
-            for dep_idx in dependent_nodes {
-
-                // add to nodes to update
-                nodes_to_update.push_back(dep_idx);
-            }           
-        }
-
-        Ok(())
-    }
-
-    /// Find the path from end node to start node
-    fn path_start_to_node(&self, end_node_idx: usize) -> Result<Vec<Point>, PathPlannerError> {
-        println!("path_start_to_node");
-        println!("end_node_idx: {}", end_node_idx);
-
-        let mut path: Vec<Point> = Vec::new();
-        let mut current_node_idx = Some(end_node_idx);
-        while current_node_idx.is_some() {
-            println!("current_node_idx: {}", current_node_idx.unwrap());
-            let current_node = &self.nodes[current_node_idx.unwrap()];
-            path.push(current_node.point.clone());
-            current_node_idx = current_node.parent_idx;
-        }
-        path.reverse();
-        Ok(path)
-    }
-    
-
-    /// Plan a path using RRT*
-    pub fn plan(&mut self) -> Result<Vec<Point>, PathPlannerError> {
-
-        let mut current_iteration = 0;
-
-        while current_iteration < self.max_iterations {
-        
-            // sample random point
-            let random_point: Point = self.random_point();
-
-            // get closest existing point and new point based on max step size
-            let (closest_point, new_point): (Point, Point) = self.new_point_step(&random_point)?;
-
-            // increment iteration
-            current_iteration += 1;
-
-            // if the point is in an obstacle, continue
-            if !self.is_obstacle_free(&closest_point, &new_point) {
-                continue;
-            }
-
-
-            // find all points in the neighborhood based on radius
-            let neighbor_nodes: Vec<(usize, f64, Node)> = self.get_neighbors(&new_point)?;
-
-            // loop through neighbors, select node with lowest cost (euclidean distance)
-            let mut lowest_cost = f64::INFINITY;
-            let mut lowest_cost_node_idx: Option<usize> = None;
-            let mut lowest_cost_neighbor_node: Option<Node> = None;
-            for (node_idx,distance, node) in &neighbor_nodes {
-
-                let new_cost = distance + node.cost;
-                if new_cost < lowest_cost {
-                    lowest_cost_node_idx = Some(*node_idx);
-                    lowest_cost = new_cost;
-                    lowest_cost_neighbor_node = Some(node.clone());
-                }
-            }
-
-            // if no node, continue
-            let Some(lowest_cost_neighbor_node) = lowest_cost_neighbor_node else {
-                continue;
-            };
-
-            // Create a new node from new point and add it to nodes
-            let added_node = Node {
-                point: new_point.clone(),
-                cost: lowest_cost + euclidean(
-                    new_point.x.clone(), 
-                    new_point.y.clone(), 
-                    lowest_cost_neighbor_node.point.x.clone(), 
-                    lowest_cost_neighbor_node.point.y.clone()
-                ),
-                parent_idx: lowest_cost_node_idx,
-            };
-            self.nodes.push(added_node.clone());
-            self.tree.add([new_point.x.clone(), new_point.y.clone()], self.nodes.len() - 1)?;
-
-            // rewire - neighbor nodes can have new parent if it is a lower cost than current state
-            for (node_idx, distance, node) in neighbor_nodes {
-                
-                let new_cost = added_node.cost + distance;
-                
-                // Update the node
-                if new_cost < node.cost {
-                    let mut new_node = node.clone();
-                    new_node.cost = new_cost;
-                    new_node.parent_idx = Some(self.nodes.len() - 1);
-
-                    // update this node
-                    self.nodes[node_idx] = new_node;
-
-                    // update dependent nodes
-                    self.update_dependent_nodes_costs(node_idx)?;
-                }
-            }
-
-            // check if this point is in the goal region - add to goal nodes
-            if (self.goal_fn)(&added_node.point) {
-                self.goal_node_idxs.insert(self.nodes.len() - 1);
-            }
-            // print iteration
-            println!("{}", current_iteration);
-        }
-
-        // Return the shortest path
-        if self.goal_node_idxs.is_empty() {
-            return Err(PathPlannerError::NoPathFound);
-        }
-
-        println!("Goal node idxs: {}", self.goal_node_idxs.len());
-        
-        // find the goal node with the lowest cost
-        let mut lowest_goal = f64::INFINITY;
-        let mut lowest_goal_idx: Option<usize> = None;
-        for node_idx in &self.goal_node_idxs {
-            let node = &self.nodes[*node_idx];
-            if node.cost < lowest_goal {
-                lowest_goal = node.cost;
-                lowest_goal_idx = Some(*node_idx);
-            }
-        }
-
-        // find the path from the lowest cost node to the start node
-        let path = self.path_start_to_node(lowest_goal_idx.unwrap())?;
-
-        Ok(path)
-    }
-
-    /// Steer is a core concept of RRT*, it is used to extend the tree towards a target point
-    /// while respecting the max step size and obstacle constraints. 
-    /// If the distance is less than the max step size, return the end point.
-    /// Otherwise, return a point on the line segment between the start and end points
-    /// that is at a distance of max_step_size from the start point.
-    fn steer(&self, start: &Point, end: &Point) -> Point {
-
-        let distance = euclidean(start.x, start.y, end.x, end.y);
-
-        if distance < self.max_step_size {
-            return end.clone();
-        } else {
-            let direction = Point {
-                x: (end.x - start.x) / distance,
-                y: (end.y - start.y) / distance,
-            };
-            let new_point = Point {
-                x: start.x + direction.x * self.max_step_size,
-                y: start.y + direction.y * self.max_step_size,
-            };
-            return new_point;
-        }
-    }
-
-    /// Check if the line to a point is obstacle free
-    fn is_obstacle_free(&self, start: &Point, end: &Point) -> bool {
-
-        for obstacle in &self.map.obstacles {
-            if obstacle.line_intersects(start, end) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// plot random point in the space
-    /// returns a random point that is not in an obstacle
-    pub fn random_point(&self) -> Point {
-
+    /// Draw one sample inside the bounds.
+    ///
+    /// Up to 32 draws are rejected when they land inside an obstacle. If every
+    /// draw is occupied the last one is returned; [`Self::plan`] still refuses
+    /// to connect it.
+    pub fn random_point(&mut self) -> Point {
         let width = self.map.bounds.1.x - self.map.bounds.0.x;
         let height = self.map.bounds.1.y - self.map.bounds.0.y;
-
-        Point {
-            x: rand::random::<f64>() * width + self.map.bounds.0.x,
-            y: rand::random::<f64>() * height + self.map.bounds.0.y,
+        let mut point = self.start;
+        for _ in 0..32 {
+            let x = self.sample_unit() * width + self.map.bounds.0.x;
+            let y = self.sample_unit() * height + self.map.bounds.0.y;
+            point = Point::new(x, y);
+            if self
+                .map
+                .obstacles
+                .iter()
+                .all(|obstacle| !obstacle.contains(&point))
+            {
+                break;
+            }
         }
+        point
+    }
+
+    /// Grow the tree and return the cheapest vertex inside the goal region.
+    ///
+    /// [`PathPlannerError::NoPathFound`] means no sample landed in the goal
+    /// region. The path is the chain of tree vertices from the start.
+    pub fn plan(&mut self) -> Result<Vec<Point>, PathPlannerError> {
+        if (self.goal_fn)(&self.start) {
+            return Ok(vec![self.start]);
+        }
+        if !self.max_step_size.is_finite() || !self.neighbor_radius.is_finite() {
+            return Err(PathPlannerError::InvalidConfiguration(
+                "RRT* step and radius must be finite".into(),
+            ));
+        }
+
+        for _ in 0..self.max_iterations {
+            let sample = self.random_point();
+            let Some((nearest_index, new_point)) = self.steer_from_nearest(sample)? else {
+                continue;
+            };
+            if !self
+                .map
+                .segment_free(self.nodes[nearest_index].point, new_point)
+            {
+                continue;
+            }
+
+            let neighbors = self.neighbors_within_radius(new_point)?;
+            let parent = self.choose_parent(nearest_index, new_point, &neighbors);
+            let Some((parent_index, cost)) = parent else {
+                continue;
+            };
+
+            let index = self.nodes.len();
+            self.nodes.push(Node {
+                point: new_point,
+                cost,
+                parent: Some(parent_index),
+            });
+            self.children.push(Vec::new());
+            self.children[parent_index].push(index);
+            self.tree.add([new_point.x, new_point.y], index)?;
+
+            self.rewire(index, &neighbors);
+            if (self.goal_fn)(&new_point) {
+                self.goals.push(index);
+            }
+        }
+
+        let best = self.goals.iter().copied().min_by(|a, b| {
+            self.nodes[*a]
+                .cost
+                .partial_cmp(&self.nodes[*b].cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(b))
+        });
+        match best {
+            Some(index) => self.path_to(index),
+            None => Err(PathPlannerError::NoPathFound),
+        }
+    }
+
+    fn sample_unit(&mut self) -> f64 {
+        match &mut self.sampler {
+            Sampler::Thread => rand::rng().random(),
+            Sampler::Seeded(rng) => rng.random(),
+        }
+    }
+
+    fn steer_from_nearest(
+        &self,
+        sample: Point,
+    ) -> Result<Option<(usize, Point)>, PathPlannerError> {
+        let nearest = self
+            .tree
+            .nearest(&[sample.x, sample.y], 1, &kt_squared_euclidean)?;
+        let Some(&(_, &index)) = nearest.first() else {
+            return Ok(None);
+        };
+        let from = self.nodes[index].point;
+        Ok(Some((index, steer(from, sample, self.max_step_size))))
+    }
+
+    /// Neighbors inside `neighbor_radius`, with true Euclidean distances.
+    ///
+    /// The index is queried with squared Euclidean distance because that is the
+    /// metric it was given. The distance it reports is therefore a squared
+    /// length and is not used.
+    fn neighbors_within_radius(&self, point: Point) -> Result<Vec<(usize, f64)>, PathPlannerError> {
+        let radius_sq = self.neighbor_radius * self.neighbor_radius;
+        let hits = self
+            .tree
+            .within(&[point.x, point.y], radius_sq, &kt_squared_euclidean)?;
+        let mut neighbors = Vec::new();
+        for (_, &index) in hits {
+            let other = self.nodes[index].point;
+            let distance = euclidean(point.x, point.y, other.x, other.y);
+            if distance <= self.neighbor_radius + 1e-9 && self.map.segment_free(other, point) {
+                neighbors.push((index, distance));
+            }
+        }
+        Ok(neighbors)
+    }
+
+    fn choose_parent(
+        &self,
+        nearest: usize,
+        point: Point,
+        neighbors: &[(usize, f64)],
+    ) -> Option<(usize, f64)> {
+        let mut best_index = nearest;
+        let mut best_cost = self.nodes[nearest].cost
+            + euclidean(
+                point.x,
+                point.y,
+                self.nodes[nearest].point.x,
+                self.nodes[nearest].point.y,
+            );
+        for &(index, distance) in neighbors {
+            let cost = self.nodes[index].cost + distance;
+            if cost < best_cost {
+                best_cost = cost;
+                best_index = index;
+            }
+        }
+        Some((best_index, best_cost))
+    }
+
+    fn rewire(&mut self, new_index: usize, neighbors: &[(usize, f64)]) {
+        let new_cost = self.nodes[new_index].cost;
+        let mut adopted = Vec::new();
+        for &(index, distance) in neighbors {
+            if index == new_index {
+                continue;
+            }
+            let candidate = new_cost + distance;
+            if candidate + 1e-12 < self.nodes[index].cost {
+                adopted.push((index, candidate));
+            }
+        }
+        for (index, cost) in adopted {
+            self.reparent(index, new_index, cost);
+        }
+    }
+
+    fn reparent(&mut self, index: usize, new_parent: usize, cost: f64) {
+        if let Some(old_parent) = self.nodes[index].parent {
+            self.children[old_parent].retain(|child| *child != index);
+        }
+        self.nodes[index].parent = Some(new_parent);
+        self.nodes[index].cost = cost;
+        self.children[new_parent].push(index);
+        self.propagate_costs(index);
+    }
+
+    /// Recompute descendant costs from the parent edge lengths.
+    ///
+    /// Only the children lists are walked, so a rewiring costs time
+    /// proportional to the affected subtree. A generation limit stops the walk
+    /// if a cycle were ever introduced.
+    fn propagate_costs(&mut self, root: usize) {
+        let mut queue = VecDeque::new();
+        queue.push_back(root);
+        let mut visits = 0usize;
+        let limit = self.nodes.len().saturating_mul(2).max(1);
+        while let Some(index) = queue.pop_front() {
+            visits += 1;
+            if visits > limit {
+                break;
+            }
+            let child_count = self.children[index].len();
+            for child_i in 0..child_count {
+                let child = self.children[index][child_i];
+                let parent_cost = self.nodes[index].cost;
+                let parent_point = self.nodes[index].point;
+                let child_point = self.nodes[child].point;
+                self.nodes[child].cost = parent_cost
+                    + euclidean(parent_point.x, parent_point.y, child_point.x, child_point.y);
+                queue.push_back(child);
+            }
+        }
+    }
+
+    fn path_to(&self, mut index: usize) -> Result<Vec<Point>, PathPlannerError> {
+        let mut path = Vec::new();
+        for _ in 0..=self.nodes.len() {
+            path.push(self.nodes[index].point);
+            match self.nodes[index].parent {
+                Some(parent) => index = parent,
+                None => {
+                    path.reverse();
+                    return Ok(path);
+                }
+            }
+        }
+        Err(PathPlannerError::NoPathFound)
+    }
+}
+
+fn steer(from: Point, to: Point, max_step: f64) -> Point {
+    let distance = euclidean(from.x, from.y, to.x, to.y);
+    if distance <= max_step || distance < 1e-12 {
+        return to;
+    }
+    let scale = max_step / distance;
+    Point::new(
+        from.x + (to.x - from.x) * scale,
+        from.y + (to.y - from.y) * scale,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_map() -> Map {
+        Map::new((Point::new(0.0, 0.0), Point::new(40.0, 40.0)))
+    }
+
+    fn wall_map() -> Map {
+        let mut map = open_map();
+        map.set_obstacles(vec![
+            Polygon::new(vec![
+                Point::new(18.0, 0.0),
+                Point::new(20.0, 0.0),
+                Point::new(20.0, 30.0),
+                Point::new(18.0, 30.0),
+            ])
+            .unwrap(),
+        ]);
+        map
+    }
+
+    fn plan(map: Map, seed: u64, iterations: usize) -> Vec<Point> {
+        let mut planner = RRTStar::new(
+            map,
+            Point::new(2.0, 20.0),
+            |point| point.distance(Point::new(36.0, 20.0)) < 3.0,
+            2.0,
+            4.0,
+            iterations,
+        )
+        .with_seed(seed);
+        planner.plan().unwrap()
+    }
+
+    #[test]
+    fn seeded_runs_match_and_reach_the_goal() {
+        let first = plan(open_map(), 5, 400);
+        let second = plan(open_map(), 5, 400);
+        assert_eq!(first, second);
+        assert!(first.len() >= 2);
+        assert!(first.last().unwrap().distance(Point::new(36.0, 20.0)) < 3.0);
+        assert_eq!(first[0], Point::new(2.0, 20.0));
+    }
+
+    #[test]
+    fn path_around_a_wall_does_not_cross_it() {
+        let map = wall_map();
+        let path = plan(map.clone(), 9, 800);
+        for pair in path.windows(2) {
+            assert!(
+                map.segment_free(pair[0], pair[1]),
+                "{:?} -> {:?} crosses the wall",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn more_iterations_do_not_increase_the_best_cost() {
+        let short = polyline_length(&plan(open_map(), 3, 150));
+        let long = polyline_length(&plan(open_map(), 3, 600));
+        assert!(
+            long <= short + 1e-6,
+            "longer run cost {long} exceeded short run {short}"
+        );
+    }
+
+    #[test]
+    fn node_cost_matches_the_path_length() {
+        let mut planner = RRTStar::new(
+            open_map(),
+            Point::new(1.0, 1.0),
+            |point| point.distance(Point::new(20.0, 20.0)) < 2.0,
+            3.0,
+            6.0,
+            250,
+        )
+        .with_seed(2);
+        let path = planner.plan().unwrap();
+        let geometric = polyline_length(&path);
+        let goal_cost = planner
+            .goals
+            .iter()
+            .map(|index| planner.nodes[*index].cost)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            (goal_cost - geometric).abs() < 1e-6,
+            "{goal_cost} vs {geometric}"
+        );
+    }
+
+    #[test]
+    fn radius_query_matches_a_brute_force_scan() {
+        let mut planner =
+            RRTStar::new(open_map(), Point::new(5.0, 5.0), |_| false, 2.0, 5.0, 0).with_seed(1);
+        for _ in 0..40 {
+            let sample = planner.random_point();
+            let steered = steer(planner.nodes[0].point, sample, 50.0);
+            let index = planner.nodes.len();
+            planner.nodes.push(Node {
+                point: steered,
+                cost: 0.0,
+                parent: Some(0),
+            });
+            planner.children.push(Vec::new());
+            planner.tree.add([steered.x, steered.y], index).unwrap();
+        }
+        let query = Point::new(12.0, 12.0);
+        let indexed = planner.neighbors_within_radius(query).unwrap();
+        let mut brute = Vec::new();
+        for (index, node) in planner.nodes.iter().enumerate() {
+            let distance = query.distance(node.point);
+            if distance <= planner.neighbor_radius + 1e-9 {
+                brute.push(index);
+            }
+        }
+        let mut from_index: Vec<_> = indexed.iter().map(|(index, _)| *index).collect();
+        from_index.sort_unstable();
+        brute.sort_unstable();
+        assert_eq!(from_index, brute);
+    }
+
+    fn polyline_length(path: &[Point]) -> f64 {
+        path.windows(2).map(|pair| pair[0].distance(pair[1])).sum()
     }
 }

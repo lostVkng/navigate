@@ -1,48 +1,75 @@
-use num_traits::{Num, Signed, Float};
+//! Planar geometry used by every planner: points, poses, polygons, and footprints.
+//!
+//! Angles that cross the branch cut use [`wrap_to_pi`], which folds radians into
+//! `(-\pi, \pi]`. Turning left is a positive curvature and a positive heading change.
+
+mod footprint;
+mod pose;
+
+pub use footprint::Footprint;
+pub use pose::{Pose2d, angle_difference, wrap_to_pi};
+
+use num_traits::{Float, Num, Signed};
+
 use crate::errors::GeometryError;
 
-
-/// Manhattan distance
+/// Manhattan distance `|x1 - x2| + |y1 - y2|`.
 pub fn manhattan_distance<T>(x1: T, y1: T, x2: T, y2: T) -> T
-where 
+where
     T: Num + Copy + Signed,
-    {
+{
     (x1 - x2).abs() + (y1 - y2).abs()
 }
 
-/// Euclidean distance
+/// Euclidean distance `hypot(x1 - x2, y1 - y2)`.
 pub fn euclidean<T>(x1: T, y1: T, x2: T, y2: T) -> T
-where 
+where
     T: Float,
-    {
+{
     ((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt()
 }
 
-/// Squared Euclidean distance
+/// Squared Euclidean distance, useful when only the order of distances matters.
 pub fn squared_euclidean<T>(x1: T, y1: T, x2: T, y2: T) -> T
-where 
+where
     T: Float,
-    {
+{
     (x1 - x2).powi(2) + (y1 - y2).powi(2)
 }
 
-
-/// 2D Point
-#[derive(Clone, Debug, PartialEq)]
+/// A point in the plane.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
+    /// Horizontal coordinate.
     pub x: f64,
+    /// Vertical coordinate.
     pub y: f64,
 }
 
+impl Point {
+    /// A point at `(x, y)`.
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
 
-/// 2D Polygon
+    /// Euclidean distance to `other`.
+    pub fn distance(self, other: Self) -> f64 {
+        (self.x - other.x).hypot(self.y - other.y)
+    }
+}
+
+/// A simple polygon, either winding order.
+///
+/// The vertex list does not have to repeat the first point. [`Polygon::contains`]
+/// uses the even-odd ray cast, and [`Polygon::line_intersects`] reports a proper
+/// crossing or a collinear overlap of the segment with any edge.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Polygon {
-    pub points: Vec<Point>, // Clockwise or counter-clockwise
+    /// Vertices in boundary order.
+    pub points: Vec<Point>,
 }
 
 impl Polygon {
-
     /// Create a new polygon from a list of points
     pub fn new(points: Vec<Point>) -> Result<Self, GeometryError> {
         if points.len() < 3 {
@@ -50,7 +77,7 @@ impl Polygon {
         }
         Ok(Self { points })
     }
-    
+
     /// Check if a point is inside the polygon
     /// Uses Ray-casting algorithm
     /// https://en.wikipedia.org/wiki/Point_in_polygon
@@ -66,8 +93,9 @@ impl Polygon {
 
             // Check if the point is on the same y-level as the edge and if the x-coordinate
             // lies within the edge's x-range, and the ray intersects the edge
-            if (vi.y > point.y) != (vj.y > point.y) &&
-               point.x < (vj.x - vi.x) * (point.y - vi.y) / (vj.y - vi.y) + vi.x {
+            if (vi.y > point.y) != (vj.y > point.y)
+                && point.x < (vj.x - vi.x) * (point.y - vi.y) / (vj.y - vi.y) + vi.x
+            {
                 inside = !inside;
             }
         }
@@ -78,7 +106,6 @@ impl Polygon {
     /// Check if a line segment intersects with the polygon
     /// Fails if the line passes through the polygon or stops inside the polygon
     pub fn line_intersects(&self, start: &Point, end: &Point) -> bool {
-
         let n = self.points.len();
 
         for i in 0..n {
@@ -86,7 +113,7 @@ impl Polygon {
             let vi = &self.points[i];
             let vj = &self.points[j];
 
-            if segments_intersect(&start, &end, vi, vj) {
+            if segments_intersect(start, end, vi, vj) {
                 return true;
             }
         }
@@ -94,7 +121,6 @@ impl Polygon {
         false
     }
 }
-
 
 /// Point Orientation
 /// Returns:
@@ -105,10 +131,10 @@ fn orientation(p: &Point, q: &Point, r: &Point) -> f64 {
 
 /// Helper function to check if point q lies on segment pr.
 fn on_segment(p: &Point, q: &Point, r: &Point) -> bool {
-    q.x <= f64::max(p.x, r.x) &&
-    q.x >= f64::min(p.x, r.x) &&
-    q.y <= f64::max(p.y, r.y) &&
-    q.y >= f64::min(p.y, r.y)
+    q.x <= f64::max(p.x, r.x)
+        && q.x >= f64::min(p.x, r.x)
+        && q.y <= f64::max(p.y, r.y)
+        && q.y >= f64::min(p.y, r.y)
 }
 
 /// Helper function to check if segments p1q1 and p2q2 intersect.
@@ -124,11 +150,18 @@ fn segments_intersect(p1: &Point, q1: &Point, p2: &Point, q2: &Point) -> bool {
     }
 
     // Special cases: collinear and point lies on segment
-    if o1 == 0.0 && on_segment(p1, p2, q1) { return true; }
-    if o2 == 0.0 && on_segment(p1, q2, q1) { return true; }
-    if o3 == 0.0 && on_segment(p2, p1, q2) { return true; }
-    if o4 == 0.0 && on_segment(p2, q1, q2) { return true; }
+    if o1 == 0.0 && on_segment(p1, p2, q1) {
+        return true;
+    }
+    if o2 == 0.0 && on_segment(p1, q2, q1) {
+        return true;
+    }
+    if o3 == 0.0 && on_segment(p2, p1, q2) {
+        return true;
+    }
+    if o4 == 0.0 && on_segment(p2, q1, q2) {
+        return true;
+    }
 
     false
 }
-
