@@ -1,307 +1,283 @@
+//! A* search (Hart, Nilsson, and Raphael, 1968).
+//!
+//! A* expands the open state with the smallest `f = g + h`, where `g` is the
+//! path cost from the start and `h` estimates the cost still to go. The
+//! estimate must be admissible (never greater than the true remaining cost)
+//! for the returned path to be optimal. It must be consistent
+//! (`h(n) ≤ c(n, n') + h(n')`) to guarantee each state is expanded at most
+//! once; a cheaper rediscovery is still accepted if it happens.
+//!
+//! When several states share an `f` value, the larger `g` is expanded first
+//! (the state with the smaller heuristic, which is usually closer to the
+//! goal). A monotonic insertion counter breaks whatever remains, so two runs
+//! on the same graph produce the same path.
+//!
+//! [`AStar::plan_keyed`] is the same search when the closed-set identity is a
+//! function of the state rather than the state itself. Hybrid-A* uses it to
+//! key continuous poses by discretized cell and heading while remembering the
+//! pose that was actually expanded.
+
+use std::fmt::Debug;
+use std::hash::Hash;
+
+use super::search::{KeyedSearchResult, path_from_map, search_identity, search_keyed};
+use super::{SearchCost, SearchLimits};
 use crate::errors::PathPlannerError;
-use crate::collections::FxIndexMap;
-use super::shortest_path;
 
-use std::{
-    collections::BinaryHeap, 
-    hash::Hash, 
-    fmt::Debug,
-    cmp::Ordering
-};
-use num_traits::Zero;
-use indexmap::map::Entry::{Occupied, Vacant};
-
-
-
-/// Node on A* graph
-#[derive(Debug)]
-struct Node<T> {
-    index: usize, // index in the closed_list - maps to the Id of the node
-    cost: T, // Cost to reach this node
-    f_cost: T, // Total cost = cost + h(n) aka estimated cost
+/// Heuristic graph search.
+#[derive(Clone, Debug)]
+pub struct AStar {
+    limits: SearchLimits,
 }
 
-impl<T: Ord> Ord for Node<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.f_cost.cmp(&self.f_cost)
+impl Default for AStar {
+    fn default() -> Self {
+        Self::new()
     }
 }
-impl<T: Ord> PartialOrd for Node<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<T: PartialEq> PartialEq for Node<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.f_cost == other.f_cost
-    }
-}
-impl<T: PartialEq> Eq for Node<T> {}
 
-/// A* Algorithm
-/// https://en.wikipedia.org/wiki/A*_search_algorithm
-pub struct AStar {}
-
-impl AStar{
-
-    /// From start Node, traverse through graph until node meets goal criteria
-    /// The Approach has 2 requirements:
-    /// 1. The heuristic function must be admissible (never overestimates the true cost to reach the goal)
-    /// 2. A path actually exists between the start and goal nodes
-    pub fn plan<N, C, IT, NN, H, G>(&self, start: N, neighbors: NN, heuristic_fn: H, goal_fn: G) -> Result<Vec<N>, PathPlannerError>
-    where 
-        N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        H: Fn(&N) -> C, // heuristic function
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        G: Fn(&N) -> bool, // node qualifier for goal
-        {
-
-        // build_a_star_graph
-        let (node_map, goal_index) = self.build_graph(start, neighbors, heuristic_fn, goal_fn)?;
-
-        // Return the shortest path
-        match goal_index {
-            Some(goal_index) => {
-                let path = shortest_path(&node_map, goal_index)?;
-                Ok(path)
-            }
-            None => Err(PathPlannerError::NoPathFound)
+impl AStar {
+    /// Unlimited search.
+    pub fn new() -> Self {
+        Self {
+            limits: SearchLimits::none(),
         }
     }
 
+    /// Replace the expansion and time budgets.
+    pub fn with_limits(mut self, limits: SearchLimits) -> Self {
+        self.limits = limits;
+        self
+    }
 
-    /// Traverses the graph using A* algorithm 
-    /// Returns a map of nodes with their smallest costs along with the index of the goal node
-    fn build_graph<N, C, IT, NN, H, G>(&self, start: N, neighbors: NN, heuristic_fn: H, goal_fn: G) -> Result<(FxIndexMap<N, (usize, C)>, Option<usize>), PathPlannerError>
-    where 
+    /// Budgets currently attached to this search.
+    pub fn limits(&self) -> &SearchLimits {
+        &self.limits
+    }
+
+    /// Path from `start` to the first expanded state that satisfies `goal_fn`.
+    ///
+    /// `neighbors` yields successors and non-negative edge costs. `heuristic`
+    /// estimates the remaining cost of a state. A zero heuristic makes this
+    /// Dijkstra's algorithm.
+    pub fn plan<N, C, IT, NN, H, G>(
+        &self,
+        start: N,
+        neighbors: NN,
+        heuristic: H,
+        goal_fn: G,
+    ) -> Result<Vec<N>, PathPlannerError>
+    where
         N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        H: Fn(&N) -> C, // heuristic function
-        G: Fn(&N) -> bool // Returns true if goal is met
+        C: SearchCost,
+        NN: Fn(&N) -> IT,
+        IT: IntoIterator<Item = (N, C)>,
+        H: FnMut(&N) -> C,
+        G: FnMut(&N) -> bool,
     {
-        // Open List
-        // Nodes that need to be evaluated, implemented as priority queue
-        // Sorting is done by f_cost (cost + heuristic)
-        let mut open_list: BinaryHeap<Node<C>> = BinaryHeap::new();
-
-        // visited nodes - cost is known, no longer need to visit
-        // Evaluated nodes, avoids re-evaluating nodes, used to find the final path
-        // The tuple contains (parent_index, cost) where parent_index is the index of the parent node in the closed_list
-        // for the start node, parent_index is set to usize::MAX to indicate it has no parent
-        let mut closed_list: FxIndexMap<N, (usize, C)> = FxIndexMap::default();
-
-        // Add the start node to both open & closed list
-        // Only this node needs to be duplicated so we can lookup its value in closed_list
-        // and also retrieve neighbors from it
-        let start_index = closed_list.insert_full(start.clone(), (usize::MAX, Zero::zero())).0;
-        open_list.push(Node{
-            index: start_index,
-            cost: Zero::zero(), // This is the cost from the start node
-            f_cost: Zero::zero(), // cost + heuristic
-        });
-
-        while let Some(Node{index, cost, ..}) = open_list.pop() {
-
-            // fetch current best cost for node
-            let (node, &(_, c)) = closed_list.get_index(index).unwrap();
-
-            // If cost of new node from BinaryHeap is higher than the best cost, skip it
-            // This implies we've already found a better path to this node
-            if cost > c {
-                continue;
-            }
-
-            // Check if we've reached the goal
-            if goal_fn(&node) {
-                return Ok((closed_list, Some(index)));
-            }
-
-            // loop over neighbors
-            for (neighbor, edge_cost) in neighbors(&node).into_iter() {
-
-                // new cost to reach this node = edge cost + node cost
-                // This is confirmed cost, not heuristic
-                let new_cost = edge_cost + c;
-
-                let neighbor_index: usize;
-                // calculate heuristic cost
-                let h_cost: C = heuristic_fn(&neighbor);
-
-                match closed_list.entry(neighbor) {
-                    Vacant(e) => {
-                        // This is the first time we're seeing this neighbor
-                        neighbor_index = e.index();
-                        e.insert((index, new_cost));
-                    }
-                    Occupied(mut e) => {
-                        if e.get().1 > new_cost {
-                            // We've found a better path to this neighbor
-                            neighbor_index = e.index();
-                            e.insert((index, new_cost));
-                        } else {
-                            // The existing path is better, do nothing
-                            continue;
-                        }
-                    }
-                }
-                
-                // Only add to the queue if we've found a better path
-                open_list.push(Node {
-                    index: neighbor_index,
-                    cost: new_cost,
-                    f_cost: new_cost + h_cost,
-                });
-            }
+        let outcome = search_identity(self.limits.clone(), start, neighbors, heuristic, goal_fn)?;
+        match outcome.goal {
+            Some(index) => path_from_map(&outcome.nodes, index),
+            None => Err(PathPlannerError::NoPathFound),
         }
-        Ok((closed_list, None))
+    }
+
+    /// A* where the closed set is keyed by `key_of(state)` instead of `state`.
+    ///
+    /// A strictly cheaper path to an existing key appends a new record. The
+    /// record that was expanded is left untouched, so a reconstructed path is
+    /// the exact sequence of states the successor function returned. `N` does
+    /// not need to implement [`Eq`] or [`Hash`]; `K` does.
+    pub fn plan_keyed<N, K, C, IT, NN, H, G, KF>(
+        &self,
+        start: N,
+        key_of: KF,
+        neighbors: NN,
+        heuristic: H,
+        goal_fn: G,
+    ) -> Result<KeyedSearchResult<N, C>, PathPlannerError>
+    where
+        N: Clone,
+        K: Eq + Hash,
+        C: SearchCost,
+        NN: Fn(&N) -> IT,
+        IT: IntoIterator<Item = (N, C)>,
+        H: FnMut(&N) -> C,
+        G: FnMut(&N) -> bool,
+        KF: Fn(&N) -> K,
+    {
+        search_keyed(
+            self.limits.clone(),
+            start,
+            key_of,
+            neighbors,
+            heuristic,
+            goal_fn,
+        )
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Helper function to create a neighbor function from a graph
-    // Assumes data stored as: HashMap<String, Vec<(String, u32)>>
-    fn create_neighbor_fn(graph: &HashMap<String, Vec<(String, u32)>>) -> impl Fn(&String) -> Vec<(String, u32)> + '_ {
-        move |node: &String| {
-            graph.get(node).unwrap_or(&vec![]).clone()
-        }
-    }
-
-    /// A* algorithm test
-    #[test]
-    fn test_a_star() {
-        // Diamond-shaped graph: A -> B -> D and A -> C -> D
-        let mut graph = HashMap::new();
-        graph.insert("A".to_string(), vec![("B".to_string(), 1), ("C".to_string(), 3)]);
-        graph.insert("B".to_string(), vec![("D".to_string(), 5)]);
-        graph.insert("C".to_string(), vec![("D".to_string(), 1)]);
-        graph.insert("D".to_string(), vec![]);
-
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Simple zero heuristic (makes A* behave like Dijkstra)
-        let heuristic = |_node: &String| 0;
-
-        // Run A* algorithm from node A to node D
-        let a_star = AStar{};
-        let path = a_star.plan(
-            "A".to_string(),
-            neighbors,
-            heuristic,
-            |node| node == "D"
-        ).unwrap();
-        
-        // The expected path is A -> C -> D (the cheapest path)
-        assert_eq!(path, vec!["A", "C", "D"].into_iter().map(String::from).collect::<Vec<_>>());
+    fn neighbors_of(
+        graph: &HashMap<String, Vec<(String, u32)>>,
+    ) -> impl Fn(&String) -> Vec<(String, u32)> + '_ {
+        move |node: &String| graph.get(node).cloned().unwrap_or_default()
     }
 
     #[test]
-    fn test_a_star_handles_unreachable_goal() {
-        // Create a graph with no path to the goal
+    fn zero_heuristic_matches_dijkstra() {
         let mut graph = HashMap::new();
-        graph.insert("A".to_string(), vec![("B".to_string(), 1)]);
-        graph.insert("B".to_string(), vec![("C".to_string(), 1)]);
-        graph.insert("C".to_string(), vec![]);
-        graph.insert("D".to_string(), vec![]); // D is not connected
-        
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Simple zero heuristic
-        let heuristic = |_node: &String| 0;
-        
-        // Try to find a path from A to D (which doesn't exist)
-        let a_star = AStar{};
-        let result = a_star.plan("A".to_string(), neighbors, heuristic, |node| node == "D");
-        
-        // Expect a NoPathFound error
+        graph.insert("A".into(), vec![("B".into(), 1), ("C".into(), 3)]);
+        graph.insert("B".into(), vec![("D".into(), 5)]);
+        graph.insert("C".into(), vec![("D".into(), 1)]);
+        graph.insert("D".into(), vec![]);
+
+        let path = AStar::new()
+            .plan("A".into(), neighbors_of(&graph), |_| 0, |node| node == "D")
+            .unwrap();
+        assert_eq!(path, vec!["A", "C", "D"]);
+    }
+
+    #[test]
+    fn unreachable_goal() {
+        let mut graph = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), 1)]);
+        graph.insert("B".into(), vec![("C".into(), 1)]);
+        graph.insert("C".into(), vec![]);
+        graph.insert("D".into(), vec![]);
+
+        let result = AStar::new().plan("A".into(), neighbors_of(&graph), |_| 0, |node| node == "D");
         assert!(matches!(result, Err(PathPlannerError::NoPathFound)));
     }
 
     #[test]
-    fn test_build_a_star_graph_with_cycle() {
-        // Create a graph with a cycle: A -> B -> C -> A
+    fn heuristic_guides_a_unique_optimal_path() {
         let mut graph = HashMap::new();
-        
-        graph.insert("A".to_string(), vec![("B".to_string(), 1)]);
-        graph.insert("B".to_string(), vec![("C".to_string(), 1)]);
-        graph.insert("C".to_string(), vec![("A".to_string(), 1), ("D".to_string(), 2)]);
-        graph.insert("D".to_string(), vec![]);
-        
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Simple zero heuristic
-        let heuristic = |_node: &String| 0;
-        
-        // Run A* algorithm from node A
-        let a_star = AStar{};
-        let (result, _) = a_star.build_graph(
-            "A".to_string(),
-            neighbors,
-            heuristic,
-            |node| node == "D"
-        ).unwrap();
-        
-        // Verify costs
-        let costs: HashMap<_, _> = result.iter().map(|(node, (_, cost))| (node.clone(), *cost)).collect();
-        
-        assert_eq!(costs.get("A").unwrap(), &0);
-        assert_eq!(costs.get("B").unwrap(), &1);
-        assert_eq!(costs.get("C").unwrap(), &2);
-        assert_eq!(costs.get("D").unwrap(), &4);
+        graph.insert("A".into(), vec![("B".into(), 1), ("C".into(), 1)]);
+        graph.insert("B".into(), vec![("D".into(), 1)]);
+        graph.insert("C".into(), vec![("D".into(), 2)]);
+        graph.insert("D".into(), vec![]);
+        let coords = HashMap::from([
+            ("A".to_string(), (0_i32, 0_i32)),
+            ("B".into(), (1, 0)),
+            ("C".into(), (0, 1)),
+            ("D".into(), (2, 0)),
+        ]);
+        let heuristic = |node: &String| {
+            let (x, y) = coords[node];
+            let (gx, gy) = coords["D"];
+            ((x - gx).abs() + (y - gy).abs()) as u32
+        };
+        let path = AStar::new()
+            .plan("A".into(), neighbors_of(&graph), heuristic, |node| {
+                node == "D"
+            })
+            .unwrap();
+        assert_eq!(path, vec!["A", "B", "D"]);
     }
 
     #[test]
-    fn test_a_star_with_heuristic() {
-        // Create a simple grid-like graph where nodes are represented as (x, y) coordinates
-        // A(0,0) -> B(1,0) -> D(2,0)
-        //   |
-        //   v
-        // C(0,1) ------> D(2,0)
-        //
-        // Direct path C->D should be chosen with a good heuristic
-        
+    fn equal_f_prefers_the_larger_g() {
+        // f(A) = g 1 + h 1 = 2, f(B) = g 2 + h 0 = 2.
+        // The higher-g tie break expands B first, and B's edge into G costs 0,
+        // so the optimal path that is discovered first is S-B-G.
         let mut graph = HashMap::new();
-        graph.insert("A".to_string(), vec![("B".to_string(), 1), ("C".to_string(), 1)]);
-        graph.insert("B".to_string(), vec![("D".to_string(), 1)]);
-        graph.insert("C".to_string(), vec![("D".to_string(), 2)]);
-        graph.insert("D".to_string(), vec![]);
-        
-        // Coordinates for each node
-        let coords = HashMap::from([
-            ("A".to_string(), (0i32, 0i32)),
-            ("B".to_string(), (1i32, 0i32)),
-            ("C".to_string(), (0i32, 1i32)),
-            ("D".to_string(), (2i32, 0i32)),
-        ]);
-        
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Manhattan distance heuristic
-        let heuristic = |node: &String| {
-            let (nx, ny) = coords.get(node).unwrap();
-            let (gx, gy) = coords.get("D").unwrap(); // Goal is D
-            ((nx - gx).abs() + (ny - gy).abs()) as u32
+        graph.insert("S".into(), vec![("A".into(), 1_u32), ("B".into(), 2)]);
+        graph.insert("A".into(), vec![("G".into(), 1)]);
+        graph.insert("B".into(), vec![("G".into(), 0)]);
+        graph.insert("G".into(), vec![]);
+        let heuristic = |node: &String| match node.as_str() {
+            "S" => 2,
+            "A" => 1,
+            "B" | "G" => 0,
+            _ => 0,
         };
-        
-        // Run A* algorithm from node A to node D
-        let a_star = AStar{};
-        let path = a_star.plan(
-            "A".to_string(),
-            neighbors,
-            heuristic,
-            |node| node == "D"
-        ).unwrap();
-        
-        // The expected path is A -> B -> D (the path guided by heuristic)
-        assert_eq!(path, vec!["A", "B", "D"].into_iter().map(String::from).collect::<Vec<_>>());
+        let path = AStar::new()
+            .plan("S".into(), neighbors_of(&graph), heuristic, |n| n == "G")
+            .unwrap();
+        assert_eq!(path, vec!["S", "B", "G"]);
+    }
+
+    #[test]
+    fn float_heuristic_and_float_edges() {
+        let mut graph: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), 1.0), ("C".into(), 2.5)]);
+        graph.insert("B".into(), vec![("D".into(), 1.0)]);
+        graph.insert("C".into(), vec![("D".into(), 0.25)]);
+        graph.insert("D".into(), vec![]);
+        let h = |node: &String| if node == "D" { 0.0 } else { 0.5 };
+        let path = AStar::new()
+            .plan(
+                "A".into(),
+                move |n: &String| graph.get(n).cloned().unwrap_or_default(),
+                h,
+                |n| n == "D",
+            )
+            .unwrap();
+        // A-B-D costs 2.0, A-C-D costs 2.75.
+        assert_eq!(path, vec!["A", "B", "D"]);
+    }
+
+    #[test]
+    fn nan_heuristic_is_invalid() {
+        let mut graph: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), 1.0)]);
+        graph.insert("B".into(), vec![]);
+        let result = AStar::new().plan(
+            "A".into(),
+            move |n: &String| graph.get(n).cloned().unwrap_or_default(),
+            |_| f64::NAN,
+            |n| n == "B",
+        );
+        assert!(matches!(result, Err(PathPlannerError::InvalidCost)));
+    }
+
+    #[test]
+    fn keyed_search_reopens_a_discretization_bucket() {
+        // Two continuous states share a key. The expensive one is generated
+        // first; the cheap one must replace it.
+        #[derive(Clone, Debug)]
+        struct State {
+            name: &'static str,
+            key: u8,
+        }
+        let result = AStar::new()
+            .plan_keyed(
+                State { name: "S", key: 0 },
+                |s: &State| s.key,
+                |s: &State| -> Vec<(State, f64)> {
+                    match s.name {
+                        "S" => vec![
+                            (
+                                State {
+                                    name: "expensive",
+                                    key: 1,
+                                },
+                                5.0,
+                            ),
+                            (
+                                State {
+                                    name: "cheap",
+                                    key: 1,
+                                },
+                                1.0,
+                            ),
+                        ],
+                        "cheap" => vec![(State { name: "G", key: 2 }, 1.0)],
+                        "expensive" => vec![(State { name: "G", key: 2 }, 1.0)],
+                        _ => vec![],
+                    }
+                },
+                |_| 0.0,
+                |s: &State| s.name == "G",
+            )
+            .unwrap();
+        let names: Vec<_> = result.path.iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["S", "cheap", "G"]);
+        assert!((result.cost - 2.0).abs() < 1e-9);
     }
 }

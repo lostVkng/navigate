@@ -1,283 +1,270 @@
+//! Dijkstra's algorithm (1959).
+//!
+//! From a start state, expand the reachable state with the smallest path cost
+//! until the goal test passes or the component is exhausted. Edge weights must
+//! be non-negative ([`SearchCost`]).
+//!
+//! This is A* with a zero heuristic, including the same tie break and the same
+//! optional [`SearchLimits`].
+
+use std::fmt::Debug;
+use std::hash::Hash;
+
+use super::search::{path_from_map, search_identity};
+use super::{GraphNodeMap, SearchCost, SearchLimits};
 use crate::errors::PathPlannerError;
-use super::{shortest_path, GraphNodeMap};
 
-use std::{
-    collections::BinaryHeap, 
-    hash::Hash, 
-    fmt::Debug,
-    cmp::Ordering
-};
-use num_traits::Zero;
-use indexmap::map::Entry::{Occupied, Vacant};
-
-
-/// Node identifier 
-/// - for ordering we only need cost and a way to identify the node
-/// - Nodes can contain additional data, but we only need to identify them
-#[derive(Debug)]
-pub struct Node<T> {
-    pub index: usize,
-    pub cost: T
+/// Shortest paths on a non-negatively weighted graph.
+#[derive(Clone, Debug)]
+pub struct Dijkstra {
+    limits: SearchLimits,
 }
 
-impl<T: Ord> Ord for Node<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.cmp(&self.cost)
+impl Default for Dijkstra {
+    fn default() -> Self {
+        Self::new()
     }
 }
-impl<T: Ord> PartialOrd for Node<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<T: PartialEq> PartialEq for Node<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cost == other.cost
-    }
-}
-impl<T: PartialEq> Eq for Node<T> {}
-
-
-/// Dijkstra Algorithm
-/// https://en.wikipedia.org/wiki/Dijkstra%27s_algorithm
-pub struct Dijkstra {}
-
 
 impl Dijkstra {
-    
-    /// From start Node, traverse through graph until node meets goal criteria
-    pub fn plan<N, C, IT, NN, G>(&self, start: N, neighbors: NN, goal_fn: G) -> Result<Vec<N>, PathPlannerError>
-    where 
+    /// Unlimited search.
+    pub fn new() -> Self {
+        Self {
+            limits: SearchLimits::none(),
+        }
+    }
+
+    /// Replace the expansion and time budgets.
+    pub fn with_limits(mut self, limits: SearchLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Budgets currently attached to this search.
+    pub fn limits(&self) -> &SearchLimits {
+        &self.limits
+    }
+
+    /// States from `start` through the first state that satisfies `goal_fn`.
+    ///
+    /// `neighbors` returns the successors of a state and the non-negative cost
+    /// of each edge. The goal test is applied when a state is about to be
+    /// expanded, which is the first time it is the cheapest open state.
+    pub fn plan<N, C, IT, NN, G>(
+        &self,
+        start: N,
+        neighbors: NN,
+        goal_fn: G,
+    ) -> Result<Vec<N>, PathPlannerError>
+    where
         N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        G: Fn(&N) -> bool, // node qualifier for goal
+        C: SearchCost,
+        NN: Fn(&N) -> IT,
+        IT: IntoIterator<Item = (N, C)>,
+        G: FnMut(&N) -> bool,
     {
-        // Build the graph - terminates when the goal is met
-        let (node_map, goal_index) = self.build_graph(start, neighbors, goal_fn)?;
-
-        // Return the shortest path
-        match goal_index {
-            Some(goal_index) => {
-                let path = shortest_path(&node_map, goal_index)?;
-                Ok(path)
-            }
-            None => Err(PathPlannerError::NoPathFound)
+        let outcome = search_identity(
+            self.limits.clone(),
+            start,
+            neighbors,
+            |_| C::zero(),
+            goal_fn,
+        )?;
+        match outcome.goal {
+            Some(index) => path_from_map(&outcome.nodes, index),
+            None => Err(PathPlannerError::NoPathFound),
         }
     }
 
-    /// Return a partial map of the graph up to the goal node
-    /// Nodes with lower cost than the goal node will be included
-    pub fn get_visited_nodes<N, C, IT, NN, G>(&self, start: N, neighbors: NN, goal: G) -> Result<GraphNodeMap<N, C>, PathPlannerError>
-    where 
+    /// Closed set at the moment the goal is expanded, including states that
+    /// were generated but not yet expanded.
+    ///
+    /// When the goal is never reached the map contains every reachable state.
+    pub fn get_visited_nodes<N, C, IT, NN, G>(
+        &self,
+        start: N,
+        neighbors: NN,
+        goal_fn: G,
+    ) -> Result<GraphNodeMap<N, C>, PathPlannerError>
+    where
         N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        G: Fn(&N) -> bool,
-        {
-
-        // Build the graph - terminates when the goal is met
-        let (node_map, _) = self.build_graph(start, neighbors, goal)?;
-        
-        Ok(node_map)
+        C: SearchCost,
+        NN: Fn(&N) -> IT,
+        IT: IntoIterator<Item = (N, C)>,
+        G: FnMut(&N) -> bool,
+    {
+        Ok(search_identity(
+            self.limits.clone(),
+            start,
+            neighbors,
+            |_| C::zero(),
+            goal_fn,
+        )?
+        .nodes)
     }
 
-
-    /// Returns a full map of the graph, includes all (reachable) nodes and costs
-    pub fn get_all_nodes<N, C, IT, NN>(&self, start: N, neighbors: NN) -> Result<GraphNodeMap<N, C>, PathPlannerError>
-    where 
+    /// Every state reachable from `start`, with its cheapest path cost.
+    ///
+    /// Equivalent to [`Self::get_visited_nodes`] with a goal test that never
+    /// matches. Set [`SearchLimits`] if the graph may be unbounded.
+    pub fn get_all_nodes<N, C, IT, NN>(
+        &self,
+        start: N,
+        neighbors: NN,
+    ) -> Result<GraphNodeMap<N, C>, PathPlannerError>
+    where
         N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        {
-
-        // Build the graph - terminates when the goal is met
-        let (node_map, _) = self.build_graph(start, neighbors, |_| false)?;
-        
-        Ok(node_map)
+        C: SearchCost,
+        NN: Fn(&N) -> IT,
+        IT: IntoIterator<Item = (N, C)>,
+    {
+        self.get_visited_nodes(start, neighbors, |_| false)
     }
-
-
-    /// Traverses the graph using Dijkstra's algorithm 
-    /// Returns a map of nodes with their smallest costs along with the index of the goal node
-    fn build_graph<N, C, IT, NN, G>(&self, start: N, neighbors: NN, goal_fn: G) -> Result<(GraphNodeMap<N, C>, Option<usize>), PathPlannerError>
-    where 
-        N: Eq + Hash + Clone + Debug,
-        NN: Fn(&N) -> IT, // returns iterator of neighbors + costs
-        IT: IntoIterator<Item = (N, C)>, // Iterator of neighbors + edge cost to neighbor node
-        C: Zero + Ord + Copy + Debug,
-        G: Fn(&N) -> bool // Returns true if goal is met
-        {
-
-        // Nodes to visit - binary heap sorts Biggest to Smallest
-        // Dijkstra's algorithm uses a priority queue to always expand the least costly node first
-        // We store the cost from the starting node
-        let mut nodes_to_visit: BinaryHeap<Node<C>> = BinaryHeap::new();
-
-        // visited nodes - cost is known, no longer need to visit
-        // usize is the index in the nodes_map
-        // The tuple contains (parent_index, cost) where parent_index is the index of the parent node in the map
-        // for the start node, parent_index is set to usize::MAX to indicate it has no parent
-        let mut nodes_map: GraphNodeMap<N, C> = GraphNodeMap::default();
-        
-        // Add start node to the map and queue
-        let start_index = nodes_map.insert_full(start.clone(), (usize::MAX, Zero::zero())).0;
-        nodes_to_visit.push(Node{
-            index: start_index,
-            cost: Zero::zero(), // This is the cost from the start node
-        });
-
-        // Loop over each node to visit, removing the smallest node
-        while let Some(Node {cost, index}) = nodes_to_visit.pop() {
-
-            // fetch current best cost for node
-            let (node, &(_, c)) = nodes_map.get_index(index).unwrap();
-
-            // If cost of new node from BinaryHeap is higher than the best cost, skip it
-            // This implies we've already found a better path to this node
-            if cost > c {
-                continue;
-            }
-
-            // Check if we've reached the goal
-            if goal_fn(&node) {
-                return Ok((nodes_map, Some(index)));
-            }
-            
-            // loop over neighbors
-            for (neighbor, edge_cost) in neighbors(&node).into_iter() {
-
-                // new cost to reach this node = edge cost + node cost
-                let new_cost = edge_cost + c;
-
-                // Check if we've found a better path to this neighbor
-                let neighbor_index;
-                
-                match nodes_map.entry(neighbor) {
-                    Vacant(e) => {
-                        // This is the first time we're seeing this neighbor
-                        neighbor_index = e.index();
-                        e.insert((index, new_cost));
-                    }
-                    Occupied(mut e) => {
-                        if e.get().1 > new_cost {
-                            // We've found a better path to this neighbor
-                            neighbor_index = e.index();
-                            e.insert((index, new_cost));
-                        } else {
-                            // The existing path is better, do nothing
-                            continue;
-                        }
-                    }
-                }
-                
-                // Only add to the queue if we've found a better path
-                nodes_to_visit.push(Node {
-                    index: neighbor_index,
-                    cost: new_cost,
-                });
-            }
-        }
-        
-        Ok((nodes_map, None))
-    }
-
 }
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::SearchLimitKind;
     use std::collections::HashMap;
 
-    // Helper function to create a neighbor function from a graph
-    // Assumes data stored as: HashMap<String, Vec<(String, u32)>>
-    fn create_neighbor_fn(graph: &HashMap<String, Vec<(String, u32)>>) -> impl Fn(&String) -> Vec<(String, u32)> + '_ {
-        move |node: &String| {
-            graph.get(node).unwrap_or(&vec![]).clone()
-        }
-    }
-
-    /// Dijkstra's algorithm test
-    #[test]
-    fn test_dijkstra() {
-
-        // Diamond-shaped graph: A -> B -> D and A -> C -> D
-        let mut graph = HashMap::new();
-        graph.insert("A".to_string(), vec![("B".to_string(), 1), ("C".to_string(), 3)]);
-        graph.insert("B".to_string(), vec![("D".to_string(), 5)]);
-        graph.insert("C".to_string(), vec![("D".to_string(), 1)]);
-        graph.insert("D".to_string(), vec![]);
-
-        let neighbors = create_neighbor_fn(&graph);
-
-        // Run Dijkstra's algorithm from node A to node D
-        let dijkstra = Dijkstra{};
-        let path = dijkstra.plan(
-            "A".to_string(),
-            neighbors,
-            |node| node == "D"
-        ).unwrap();
-        
-        // The expected path is A -> C -> D (the cheapest path)
-        assert_eq!(path, vec!["A", "C", "D"].into_iter().map(String::from).collect::<Vec<_>>());
+    fn neighbors_of(
+        graph: &HashMap<String, Vec<(String, u32)>>,
+    ) -> impl Fn(&String) -> Vec<(String, u32)> + '_ {
+        move |node: &String| graph.get(node).cloned().unwrap_or_default()
     }
 
     #[test]
-    fn test_dijkstra_handles_unreachable_goal() {
-        // Create a graph with no path to the goal
+    fn cheapest_path_on_a_diamond() {
         let mut graph = HashMap::new();
-        graph.insert("A".to_string(), vec![("B".to_string(), 1)]);
-        graph.insert("B".to_string(), vec![("C".to_string(), 1)]);
-        graph.insert("C".to_string(), vec![]);
-        graph.insert("D".to_string(), vec![]); // D is not connected
-        
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Try to find a path from A to D (which doesn't exist)
-        let dijkstra = Dijkstra{};
-        let result = dijkstra.plan("A".to_string(), neighbors, |node| node == "D");
-        
-        // Expect a NoPathFound error
+        graph.insert("A".into(), vec![("B".into(), 1), ("C".into(), 3)]);
+        graph.insert("B".into(), vec![("D".into(), 5)]);
+        graph.insert("C".into(), vec![("D".into(), 1)]);
+        graph.insert("D".into(), vec![]);
+
+        let path = Dijkstra::new()
+            .plan("A".into(), neighbors_of(&graph), |node| node == "D")
+            .unwrap();
+        assert_eq!(path, vec!["A", "C", "D"]);
+    }
+
+    #[test]
+    fn unreachable_goal() {
+        let mut graph = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), 1)]);
+        graph.insert("B".into(), vec![("C".into(), 1)]);
+        graph.insert("C".into(), vec![]);
+        graph.insert("D".into(), vec![]);
+
+        let result = Dijkstra::new().plan("A".into(), neighbors_of(&graph), |node| node == "D");
         assert!(matches!(result, Err(PathPlannerError::NoPathFound)));
     }
 
     #[test]
-    fn test_build_dijkstra_graph_with_cycle() {
-        // Create a graph with a cycle: A -> B -> C -> A
+    fn cycle_does_not_prevent_the_shortest_costs() {
         let mut graph = HashMap::new();
-        
-        graph.insert("A".to_string(), vec![("B".to_string(), 1)]);
-        graph.insert("B".to_string(), vec![("C".to_string(), 1)]);
-        graph.insert("C".to_string(), vec![("A".to_string(), 1), ("D".to_string(), 2)]);
-        graph.insert("D".to_string(), vec![]);
-        
-        let neighbors = create_neighbor_fn(&graph);
-        
-        // Run Dijkstra's algorithm from node A
-        let dijkstra = Dijkstra{};
-        let (result, _) = dijkstra.build_graph(
-            "A".to_string(),
-            neighbors,
-            |node| node == "D"
-        ).unwrap();
-        
-        // Verify costs
-        let costs: HashMap<_, _> = result.iter().map(|(node, (_, cost))| (node.clone(), *cost)).collect();
-        
-        assert_eq!(costs.get("A").unwrap(), &0);
-        assert_eq!(costs.get("B").unwrap(), &1);
-        assert_eq!(costs.get("C").unwrap(), &2);
-        assert_eq!(costs.get("D").unwrap(), &4);
+        graph.insert("A".into(), vec![("B".into(), 1)]);
+        graph.insert("B".into(), vec![("C".into(), 1)]);
+        graph.insert("C".into(), vec![("A".into(), 1), ("D".into(), 2)]);
+        graph.insert("D".into(), vec![]);
+
+        let nodes = Dijkstra::new()
+            .get_visited_nodes("A".into(), neighbors_of(&graph), |node| node == "D")
+            .unwrap();
+        let cost = |name: &str| nodes.get(name).unwrap().1;
+        assert_eq!(cost("A"), 0);
+        assert_eq!(cost("B"), 1);
+        assert_eq!(cost("C"), 2);
+        assert_eq!(cost("D"), 4);
+    }
+
+    #[test]
+    fn float_costs_choose_the_shorter_real_path() {
+        let mut graph = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), 1.5_f64), ("C".into(), 2.0)]);
+        graph.insert("B".into(), vec![("D".into(), 1.5)]);
+        graph.insert("C".into(), vec![("D".into(), 0.5)]);
+        graph.insert("D".into(), vec![]);
+
+        let path = Dijkstra::new()
+            .plan("A".into(), neighbors_of_f64(&graph), |node| node == "D")
+            .unwrap();
+        assert_eq!(path, vec!["A", "C", "D"]);
+    }
+
+    fn neighbors_of_f64(
+        graph: &HashMap<String, Vec<(String, f64)>>,
+    ) -> impl Fn(&String) -> Vec<(String, f64)> + '_ {
+        move |node: &String| graph.get(node).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn equal_costs_follow_insertion_order() {
+        // Both branches cost 2. Neighbors are emitted A then B, so A is
+        // inserted first and must be the parent of G.
+        let mut graph = HashMap::new();
+        graph.insert("S".into(), vec![("A".into(), 1.0_f64), ("B".into(), 1.0)]);
+        graph.insert("A".into(), vec![("G".into(), 1.0)]);
+        graph.insert("B".into(), vec![("G".into(), 1.0)]);
+        graph.insert("G".into(), vec![]);
+
+        let path = Dijkstra::new()
+            .plan("S".into(), neighbors_of_f64(&graph), |node| node == "G")
+            .unwrap();
+        assert_eq!(path, vec!["S", "A", "G"]);
+    }
+
+    #[test]
+    fn negative_edge_is_rejected() {
+        let mut graph = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), -1_i32)]);
+        graph.insert("B".into(), vec![]);
+        let result = Dijkstra::new().plan("A".into(), neighbors_of_i32(&graph), |node| node == "B");
+        assert!(matches!(result, Err(PathPlannerError::NegativeCost)));
+    }
+
+    fn neighbors_of_i32(
+        graph: &HashMap<String, Vec<(String, i32)>>,
+    ) -> impl Fn(&String) -> Vec<(String, i32)> + '_ {
+        move |node: &String| graph.get(node).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn expansion_budget_stops_a_long_chain() {
+        let mut graph = HashMap::new();
+        for i in 0..50 {
+            graph.insert(format!("n{i}"), vec![(format!("n{}", i + 1), 1_u32)]);
+        }
+        graph.insert("n50".into(), vec![]);
+        let result = Dijkstra::new()
+            .with_limits(SearchLimits::expansions(3))
+            .plan("n0".into(), neighbors_of(&graph), |node| node == "n50");
+        match result {
+            Err(PathPlannerError::SearchLimitExceeded {
+                kind: SearchLimitKind::Expansions,
+                ..
+            }) => {}
+            other => panic!("expected expansion limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_is_a_zero_length_path_when_it_is_the_goal() {
+        let graph: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let path = Dijkstra::new()
+            .with_limits(SearchLimits::expansions(0))
+            .plan("A".into(), neighbors_of(&graph), |node| node == "A")
+            .unwrap();
+        assert_eq!(path, vec!["A"]);
+    }
+
+    #[test]
+    fn integer_overflow_is_an_invalid_cost() {
+        let mut graph = HashMap::new();
+        graph.insert("A".into(), vec![("B".into(), u32::MAX)]);
+        graph.insert("B".into(), vec![("C".into(), 1)]);
+        graph.insert("C".into(), vec![]);
+        let result = Dijkstra::new().plan("A".into(), neighbors_of(&graph), |node| node == "C");
+        assert!(matches!(result, Err(PathPlannerError::InvalidCost)));
     }
 }
