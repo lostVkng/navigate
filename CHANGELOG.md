@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1
+
+Swept-footprint collision checks for the existing hybrid-A* planner, plus
+synthetic route tests and a drawing of those routes.
+
+- Hybrid-A* and the shortcut smoother reject a motion unless the whole
+  footprint, not only the sampled poses, stays inside the grid and off
+  occupied cells. The split size is [`HybridAStarConfig::sweep_tolerance`]
+  (default 0.02 m). That value is a numerical tolerance, not a safety margin.
+- [`GridMap::in_collision`] treats a footprint that overhangs the border as a
+  collision even when the rear axle is still inside.
+- [`check_planned_path`] re-integrates a stored route and repeats the sweep.
+  An in-place spin, a curvature past the steering limit, or a hit between
+  samples returns [`PathPlannerError::PathInfeasible`].
+- `HybridAStarConfig` and `PathSmoother` each gain a `sweep_tolerance` field.
+  Struct literals that name every field need to set it; `..Default::default()`
+  does not.
+- [`planning::synthetic`] holds the placeholder vehicle and the maps used by
+  `cargo test --test offline_routes` and `cargo run --release --example route_demo`.
+  Those lengths are not measurements.
+- Non-finite start and goal poses and a footprint that does not contain the
+  rear axle return [`PathPlannerError::InvalidConfiguration`].
+
 ## 0.2.0
 
 Planning and control for car-like vehicles, plus the search and sampling fixes

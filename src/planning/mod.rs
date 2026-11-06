@@ -4,7 +4,8 @@
 //! primitives come from the bicycle model, and a Dubins or Reeds–Shepp curve
 //! is tried as an analytic connection to the goal. The search itself is
 //! [`crate::AStar::plan_keyed`]: the key is the discrete pose and the record
-//! keeps the continuous pose that produced it.
+//! keeps the continuous pose that produced it. Every primitive is rejected
+//! unless the whole swept footprint stays clear, not only the sampled poses.
 //!
 //! The obstacle heuristic is a cost-aware 8-connected Dijkstra run backward
 //! from the goal (reusing [`crate::Dijkstra`]). The non-holonomic heuristic is
@@ -14,9 +15,16 @@
 //! Fischer (arXiv:2401.13078) on top of the hybrid-A\* search of Dolgov,
 //! Thrun, Montemerlo, and Diebel (*International Journal of Robotics Research*,
 //! 2010).
+//!
+//! [`synthetic`] builds the maps used by the route demo and the integration
+//! tests. Its wheelbase, steering limit, and footprint are round placeholders,
+//! not measurements.
 
+mod check;
 mod hybrid_astar;
 mod smoother;
+pub mod synthetic;
 
+pub use check::check_planned_path;
 pub use hybrid_astar::{HybridAStar, HybridAStarConfig, PlannedPath};
 pub use smoother::PathSmoother;

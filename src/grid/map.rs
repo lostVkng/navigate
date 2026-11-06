@@ -1,7 +1,7 @@
 //! Grid storage, inflation, and footprint collision checks.
 
 use crate::errors::PathPlannerError;
-use crate::geometry::{Footprint, Point, Pose2d};
+use crate::geometry::{Footprint, Point, Pose2d, sweep_half_chord, sweep_step_length};
 
 use super::distance_transform::squared_distance_transform;
 
@@ -331,15 +331,13 @@ impl GridMap {
 
     /// `true` when the footprint touches a non-free cell or leaves the grid.
     ///
-    /// Contact counts as collision. Out-of-bounds queries are collisions, so a
-    /// planner cannot drive off the map. The test is exact against cell squares
-    /// (circle–AABB or separating-axis for an oriented rectangle), with a
-    /// distance-field rejection when the query is clearly in open space.
+    /// Contact counts as collision. Any part of the footprint that leaves the
+    /// grid is a collision, including an overhang whose reference point is
+    /// still inside. The test is exact against cell squares (circle–AABB or
+    /// separating-axis for an oriented rectangle), with a distance-field
+    /// rejection when the query is clearly in open space.
     pub fn in_collision(&self, pose: Pose2d, footprint: &Footprint) -> bool {
-        if !pose.x.is_finite() || !pose.y.is_finite() || !pose.theta.is_finite() {
-            return true;
-        }
-        if self.world_to_cell(pose.x, pose.y).is_none() {
+        if self.footprint_leaves_map(pose, footprint) {
             return true;
         }
         if self.clear_by_distance(pose, footprint) {
@@ -349,6 +347,72 @@ impl GridMap {
             Footprint::Circle { radius } => self.circle_hits(pose.x, pose.y, radius.max(0.0)),
             Footprint::OrientedRectangle { .. } => self.rectangle_hits(pose, footprint),
         }
+    }
+
+    /// `true` when the footprint collides while following a constant-curvature arc.
+    ///
+    /// `distance` is signed arc length in meters, matching
+    /// [`Pose2d::advance`](crate::geometry::Pose2d::advance). The arc is split
+    /// so that [`sweep_half_chord`] of each piece is at most `sweep_tolerance`,
+    /// and both endpoints of every piece are tested with the footprint enlarged
+    /// by that half-chord. An intermediate pose of a rigid body cannot stray
+    /// farther than the half-chord from the nearer endpoint, so a clear result
+    /// covers the whole swept volume, not only the samples.
+    ///
+    /// A zero-length move tests the true footprint once. A non-positive or
+    /// non-finite tolerance fails closed and reports a collision. The
+    /// enlargement is a numerical tolerance: a body that clears an obstacle by
+    /// less than `sweep_tolerance` may be reported as a hit.
+    pub fn sweep_in_collision(
+        &self,
+        start: Pose2d,
+        curvature: f64,
+        distance: f64,
+        footprint: &Footprint,
+        sweep_tolerance: f64,
+    ) -> bool {
+        if !distance.is_finite() || !curvature.is_finite() {
+            return true;
+        }
+        if distance.abs() < 1e-12 {
+            return self.in_collision(start, footprint);
+        }
+        let step = sweep_step_length(*footprint, curvature, sweep_tolerance);
+        if step <= 0.0 {
+            return true;
+        }
+        let pieces = (distance.abs() / step).ceil().max(1.0);
+        if !pieces.is_finite() || pieces > 200_000.0 {
+            return true;
+        }
+        let pieces = pieces as usize;
+        let piece = distance / pieces as f64;
+        let margin = sweep_half_chord(*footprint, curvature, piece);
+        let query = footprint.inflated(margin);
+        let mut pose = start;
+        if self.in_collision(pose, &query) {
+            return true;
+        }
+        for _ in 0..pieces {
+            pose = pose.advance(curvature, piece);
+            if self.in_collision(pose, &query) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn footprint_leaves_map(&self, pose: Pose2d, footprint: &Footprint) -> bool {
+        let Some((min_x, min_y, max_x, max_y)) = footprint.world_aabb(pose) else {
+            return true;
+        };
+        let far_x = self.origin_x + self.width as f64 * self.resolution;
+        let far_y = self.origin_y + self.height as f64 * self.resolution;
+        const EDGE: f64 = 1e-7;
+        min_x < self.origin_x - EDGE
+            || min_y < self.origin_y - EDGE
+            || max_x > far_x + EDGE
+            || max_y > far_y + EDGE
     }
 
     fn note_unknown_change(&mut self, previous: Occupancy, next: Occupancy) {
@@ -603,5 +667,49 @@ mod tests {
         let map = open_map();
         let circle = Footprint::Circle { radius: 0.2 };
         assert!(map.in_collision(Pose2d::new(-1.0, 1.0, 0.0), &circle));
+    }
+
+    #[test]
+    fn overhang_past_the_border_is_a_collision_even_with_a_clear_distance_field() {
+        let mut map = open_map();
+        map.compute_distance_field().unwrap();
+        let circle = Footprint::Circle { radius: 0.5 };
+        // Rear axle is inside the grid; the disk crosses the origin.
+        assert!(map.in_collision(Pose2d::new(0.2, 1.0, 0.0), &circle));
+        assert!(!map.in_collision(Pose2d::new(2.0, 2.0, 0.0), &circle));
+    }
+
+    #[test]
+    fn sweep_catches_a_gap_between_clear_endpoints() {
+        let mut map = GridMap::new(80, 80, 0.05, 0.0, 0.0).unwrap();
+        let body = Footprint::OrientedRectangle {
+            length: 0.40,
+            width: 0.20,
+            rear_overhang: 0.10,
+        };
+        let start = Pose2d::new(1.0, 1.0, 0.0);
+        let distance = 0.80;
+        let end = start.advance(0.0, distance);
+        // Body covers x in [0.90, 1.30] at the start and [1.70, 2.10] at the
+        // end. The cell around x = 1.50 sits in the gap.
+        map.set_occupancy(30, 20, Occupancy::Occupied).unwrap();
+        map.compute_distance_field().unwrap();
+        assert!(!map.in_collision(start, &body), "start should be clear");
+        assert!(!map.in_collision(end, &body), "end should be clear");
+        assert!(map.sweep_in_collision(start, 0.0, distance, &body, 0.02));
+        assert!(map.sweep_in_collision(end, 0.0, -distance, &body, 0.02));
+    }
+
+    #[test]
+    fn sweep_of_an_open_arc_is_clear() {
+        let mut map = GridMap::new(80, 80, 0.05, 0.0, 0.0).unwrap();
+        map.compute_distance_field().unwrap();
+        let body = Footprint::OrientedRectangle {
+            length: 0.40,
+            width: 0.20,
+            rear_overhang: 0.10,
+        };
+        let start = Pose2d::new(2.0, 2.0, 0.4);
+        assert!(!map.sweep_in_collision(start, 0.7, 1.1, &body, 0.02));
     }
 }

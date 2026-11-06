@@ -30,7 +30,7 @@ The 0.2 release changes the 0.1 graph-search constructors and the cost-type boun
 | A graph with non-negative edge weights and no estimate of remaining cost | [`Dijkstra`](src/graph_algos/dijkstra.rs) |
 | The same graph, plus a heuristic that does not overestimate | [`AStar`](src/graph_algos/a_star.rs) |
 | A point robot and polygonal obstacles, and any heading is drivable | [`RRTStar`](src/sampling_algos/rrt_star.rs) |
-| A car-like robot that must respect a turning radius on a grid | [`HybridAStar`](src/planning/hybrid_astar.rs), then optionally [`PathSmoother`](src/planning/smoother.rs) |
+| A car-like robot that must respect a turning radius on a grid | [`HybridAStar`](src/planning/hybrid_astar.rs), then optionally [`PathSmoother`](src/planning/smoother.rs). See [docs/offline-planner.md](docs/offline-planner.md) |
 | A path to follow and a simple, explainable speed law | [`PurePursuit`](src/control/pure_pursuit.rs) |
 | A path to follow while trading off obstacles, smoothness, and actuator limits | [`Mppi`](src/control/mppi.rs) |
 
@@ -74,6 +74,7 @@ cargo run --example rrt_star
 cargo run --example costmap
 cargo run --example reeds_shepp
 cargo run --example hybrid_astar
+cargo run --release --example route_demo
 cargo run --example pure_pursuit
 cargo run --example mppi
 cargo run --example mppi --features rayon
@@ -90,16 +91,20 @@ Measured with `cargo bench --bench planners` on a 4-thread x86-64 guest. Times a
 | Euclidean distance transform, 128×128 | 195 µs |
 | Euclidean distance transform, 256×256 | 802 µs |
 | Euclidean distance transform, 512×512 | 4.89 ms |
-| Hybrid-A*, 40 m × 20 m grid at 0.5 m, one obstacle | 6.92 ms |
+| Hybrid-A*, 40 m × 20 m grid at 0.5 m, one obstacle | 6.92 ms (0.2.0, before swept-footprint checks) |
 | Regulated pure pursuit, one command | 2.48 µs |
 | MPPI, horizon 20, 256 samples | 2.91 ms (0.89 ms with `rayon`) |
 | MPPI, horizon 20, 1024 samples | 11.4 ms (3.51 ms with `rayon`) |
 
 At 1024 samples the sequential update is about 88 Hz on this guest. Scaling the same measurement, a couple of thousand samples is still a few tens of hertz on one core. A slower core will land lower; the rollout itself does not allocate.
 
+The hybrid-A* row is the 0.2.0 figure, measured before collision checks swept the footprint. Release times for the synthetic routes in 0.2.1, including those checks, are in [docs/offline-planner.md](docs/offline-planner.md).
+
 ## What is not here
 
 Hybrid-A* is complete for its motion primitives and its grid, not a proof of the globally shortest drivable curve. The obstacle heuristic is a grid distance, so it can be slightly pessimistic or slightly optimistic relative to a continuous holonomic path; the non-holonomic length is what keeps the search honest about turning. There is no incremental replanner, no distance-table cache for Reeds–Shepp, and the smoother only shortcuts with feasible curves. It does not solve a general optimal-control smoothing problem.
+
+The numbers in the examples are placeholders. This crate does not ship a measured wheelbase, steering map, footprint, or stopping distance, and a route that passes [`check_planned_path`](src/planning/check.rs) is not evidence that a physical vehicle can execute it. Sensor costmaps and depth are out of scope here; a caller that has an occupancy grid can pass it in, but nothing in this repository builds one from a camera. Details and the route-demo commands are in [docs/offline-planner.md](docs/offline-planner.md).
 
 ## License
 
