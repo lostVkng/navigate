@@ -32,6 +32,7 @@ The 0.2 release changes the 0.1 graph-search constructors and the cost-type boun
 | A point robot and polygonal obstacles, and any heading is drivable | [`RRTStar`](src/sampling_algos/rrt_star.rs) |
 | A car-like robot that must respect a turning radius on a grid | [`HybridAStar`](src/planning/hybrid_astar.rs), then optionally [`PathSmoother`](src/planning/smoother.rs). See [docs/offline-planner.md](docs/offline-planner.md) |
 | A path to follow and a simple, explainable speed law | [`PurePursuit`](src/control/pure_pursuit.rs) |
+| A validated route to simulate, including reverse and a stale-ticket check | [`follow_route`](src/control/follow.rs). See [docs/route-following.md](docs/route-following.md) |
 | A path to follow while trading off obstacles, smoothness, and actuator limits | [`Mppi`](src/control/mppi.rs) |
 
 Dijkstra and A* accept integer or floating-point costs. Equal `f` values expand the state with the larger path cost first, then the one inserted earlier, so the same graph yields the same path. [`SearchLimits`](src/graph_algos/limits.rs) stops a search after a number of expansions or a wall-clock duration.
@@ -76,6 +77,7 @@ cargo run --example reeds_shepp
 cargo run --example hybrid_astar
 cargo run --release --example route_demo
 cargo run --release --example replan_demo
+cargo run --release --example route_follow_demo
 cargo run --example pure_pursuit
 cargo run --example mppi
 cargo run --example mppi --features rayon
@@ -105,7 +107,7 @@ The hybrid-A* row is the 0.2.0 figure, measured before collision checks swept th
 
 Hybrid-A* is complete for its motion primitives and its grid, not a proof of the globally shortest drivable curve. The obstacle heuristic is a grid distance, so it can be slightly pessimistic or slightly optimistic relative to a continuous holonomic path; the non-holonomic length is what keeps the search honest about turning. There is no incremental replanner, no distance-table cache for Reeds–Shepp, and the smoother only shortcuts with feasible curves. It does not solve a general optimal-control smoothing problem.
 
-The numbers in the examples are placeholders. This crate does not ship a measured wheelbase, steering map, footprint, or stopping distance, and a route that passes [`check_planned_path`](src/planning/check.rs) is not evidence that a physical vehicle can execute it. Sensor costmaps and depth are out of scope here; a caller that has an occupancy grid can pass it in, but nothing in this repository builds one from a camera. Details and the route-demo commands are in [docs/offline-planner.md](docs/offline-planner.md).
+The numbers in the examples are placeholders. This crate does not ship a measured wheelbase, steering map, footprint, or stopping distance, and a route that passes [`check_planned_path`](src/planning/check.rs) is not evidence that a physical vehicle can execute it. [`follow_route`](src/control/follow.rs) is a kinematic simulation of that route. A run inside the tracking band is not evidence the vehicle can stop. Sensor costmaps and depth are out of scope here; a caller that has an occupancy grid can pass it in, but nothing in this repository builds one from a camera. Details are in [docs/offline-planner.md](docs/offline-planner.md) and [docs/route-following.md](docs/route-following.md).
 
 ## License
 

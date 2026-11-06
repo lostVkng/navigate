@@ -1,6 +1,6 @@
 [package]
 name = "navigate"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Tom Jones <tomfjones8@gmail.com>"]
 description = "Search, sampling, grid, and car-like planning and control algorithms"
 readme = "README.md"
