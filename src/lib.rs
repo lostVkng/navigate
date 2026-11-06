@@ -10,8 +10,8 @@
 //!   distance-based cost inflation.
 //! * [`motion`] — a kinematic bicycle model, Dubins paths, and Reeds–Shepp paths.
 //! * [`planning`] — hybrid-A\* for a car-like robot, swept-footprint checks, snapshot replanning, and a shortcut smoother.
-//! * [`control`] — regulated pure pursuit and model-predictive path-integral
-//!   control.
+//! * [`control`] — regulated pure pursuit, Stanley route following, and
+//!   model-predictive path-integral control.
 //!
 //! [`prelude`] re-exports the types used by a typical program.
 

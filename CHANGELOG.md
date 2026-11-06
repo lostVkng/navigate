@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.3
+
+Offline simulation of a bicycle following a validated route.
+
+- [`follow_route`] integrates [`BicycleModel`] along a [`RoutePlan`] with a
+  rear-axle Stanley tracker. Forward and reverse segments are separate gears:
+  the speed setpoint stops at a cusp, the steering slews, then the sign flips.
+  Pure pursuit stays the geometric tracker it already was; its lookahead can
+  step past a cusp, so it is not the follower used here.
+- The plant enforces the bicycle's steering angle, steering rate, speed, and
+  acceleration limits. Setpoints can be delayed by a whole number of steps.
+  Measurement and actuation noise are zero-mean Gaussians from a seeded
+  generator. The same seed repeats.
+- A run reports cross-track error, heading error, goal pose error, and whether
+  the footprint swept into the grid during the simulated motion. Exceeding a
+  tolerance or colliding returns [`TrackingError`] instead of a success report.
+  A ticket whose frame, revision, or clearance does not match the grid returns
+  [`TrackingError::StaleRoute`] and is not followed.
+- Gains, speeds, the delay, and the acceptance gates in
+  [`FollowConfig::placeholder`] match the synthetic vehicle. They are not
+  measurements, and a passing run is not a stopping test.
+- `cargo test --test route_following` and
+  `cargo run --release --example route_follow_demo`.
+
 ## 0.2.2
 
 Offline occupancy snapshots and replanning on the existing swept hybrid-A* planner.
