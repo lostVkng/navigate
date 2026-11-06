@@ -22,9 +22,11 @@
 
 mod check;
 mod hybrid_astar;
+mod route;
 mod smoother;
 pub mod synthetic;
 
 pub use check::check_planned_path;
 pub use hybrid_astar::{HybridAStar, HybridAStarConfig, PlannedPath};
+pub use route::{RoutePlan, RouteRefresh, RouteRequest, plan_route, refresh_route};
 pub use smoother::PathSmoother;

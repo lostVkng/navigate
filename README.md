@@ -75,6 +75,7 @@ cargo run --example costmap
 cargo run --example reeds_shepp
 cargo run --example hybrid_astar
 cargo run --release --example route_demo
+cargo run --release --example replan_demo
 cargo run --example pure_pursuit
 cargo run --example mppi
 cargo run --example mppi --features rayon

@@ -92,6 +92,76 @@ a measured value is a caller change: construct a `BicycleModel` and a
 `Footprint` and pass them to `plan`. Do not treat the demo picture as a
 template for a real robot.
 
+## Obstacle snapshots and replanning
+
+[`GridMap`] is the occupancy interface. It stores resolution, the minimum
+corner of cell `(0, 0)`, and an opaque `frame_id`. Cell `(i, j)` covers
+
+```text
+[origin_x + i * resolution, origin_x + (i + 1) * resolution)
+[origin_y + j * resolution, origin_y + (j + 1) * resolution)
+```
+
+in that frame. The grid does not convert between frames. [`Occupancy`] is
+`Free`, `Occupied`, or `Unknown`. Unknown cells are blocked. A query outside
+the grid is blocked. [`GridMap::apply_aabb`] cannot mark those outside cells
+free.
+
+`revision` starts at 0. It advances by one when a mutating call changes at
+least one cell, or when `set_frame_id` changes the name. Writing the same
+occupancy again does not advance it. Rebuilding the distance field or the
+soft cost layer does not advance it. There is no timestamp, so validity does
+not depend on wall-clock time.
+
+[`plan_route`] runs hybrid-A* and [`check_planned_path`], then stamps a
+[`RoutePlan`] with the frame, the revision, and the clearance it used.
+[`RoutePlan::path`] stays readable after the grid changes, and
+[`RoutePlan::validated_path`] returns `None` until the triple matches again.
+[`refresh_route`] either re-stamps the same geometry ([`RouteRefresh::StillClear`]),
+replaces it ([`RouteRefresh::Replanned`]), or returns
+[`RouteRefresh::NoSafeRoute`]. The previous ticket is not updated in place.
+
+`RouteRequest::clearance` grows the footprint once before that check. It is
+not also painted into the grid. `sweep_tolerance` is still only the numerical
+half-chord bound. [`GridMap::inflate`] writes a soft traversal cost and does
+not change occupancy. Using all three as if they were the same safety margin
+would count the body more than once. None of them is a stopping distance.
+
+```text
+cargo test --test obstacle_replans
+cargo run --release --example replan_demo
+```
+
+The demo writes `assets/replan_demo.svg` and `assets/replan_demo.png`. One
+release run on the same x86-64 guest:
+
+| Snapshot | Length | Expansions | Revision | Time |
+| --- | ---: | ---: | ---: | ---: |
+| Initial corridor | 4.200 m | 1 | 4 | 0.3 ms |
+| Replan around a plug | 4.344 m | 30 | 5 | 1.0 ms |
+| Gate closed | no safe route | — | 3 | 47 ms |
+
+Debug and release can pick different feasible detours because the sweep test
+uses transcendental functions. The regression lock is the debug test:
+initial length 4.200 m in 1 expansion, replan length 4.965 m in 157
+expansions, and `NoPathFound` when the gate is closed. `obstacle_replans`
+finished in about 0.4 s in debug.
+
+## Later integration
+
+A program that owns a robot can adapt a sensor-neutral occupancy snapshot
+into `GridMap` later. That adapter is not in this crate. It would supply
+resolution, origin, and `frame_id`; copy free, occupied, and unknown without
+turning unknown into free; and pass the body plus one clearance into
+`plan_route`. It would drop a `RoutePlan` when the frame, revision, or
+clearance changes. It would not rasterize the footprint into occupied cells.
+
+This crate does not read depth, odometry, or camera frames, and it does not
+treat a synthetic patch as a camera. Wheelbase, steering map, body outline,
+and any physical clearance still have to be measured before a route is used
+on hardware. A sequence of static grids does not predict moving obstacles and
+does not prove the vehicle can stop.
+
 ## What this does not establish
 
 A feasible simulated route is not evidence that a physical vehicle can follow
@@ -110,11 +180,9 @@ Reverse in this crate is a geometric option. It does not look behind the
 vehicle. A layout that is only solvable by reversing should stay out of any
 runtime that cannot see that space.
 
-This crate does not command motors, does not read sensors, and does not build
-an occupancy grid from depth. Passing a synthetic `GridMap` is the whole
-mapping interface used here. Wiring a live costmap, transforms, and unknown
-space is the next milestone, and it belongs in the program that owns the
-robot, not in this library.
+This crate does not command motors and does not read sensors. The occupancy
+interface is `GridMap` plus `plan_route`. Filling that grid from depth or
+odometry belongs in the program that owns the robot.
 
 Search limits (`SearchLimits`) bound expansions or wall time. Hitting a limit
 is [`PathPlannerError::SearchLimitExceeded`], which is different from
@@ -129,3 +197,15 @@ set is exhausted does not prove the goal is unreachable.
 [`planning::synthetic`]: ../src/planning/synthetic.rs
 [`PathPlannerError::SearchLimitExceeded`]: ../src/errors.rs
 [`PathPlannerError::NoPathFound`]: ../src/errors.rs
+[`GridMap`]: ../src/grid/map.rs
+[`Occupancy`]: ../src/grid/map.rs
+[`GridMap::apply_aabb`]: ../src/grid/map.rs
+[`plan_route`]: ../src/planning/route.rs
+[`RoutePlan`]: ../src/planning/route.rs
+[`RoutePlan::path`]: ../src/planning/route.rs
+[`RoutePlan::validated_path`]: ../src/planning/route.rs
+[`refresh_route`]: ../src/planning/route.rs
+[`RouteRefresh::StillClear`]: ../src/planning/route.rs
+[`RouteRefresh::Replanned`]: ../src/planning/route.rs
+[`RouteRefresh::NoSafeRoute`]: ../src/planning/route.rs
+[`GridMap::inflate`]: ../src/grid/map.rs

@@ -284,6 +284,99 @@ fn carve_free(map: &mut GridMap, min: Point, max: Point) {
     }
 }
 
+/// Corridor used by the offline replan demo and tests.
+///
+/// The free band is `y` in `[0.8, 2.6]` and `x` in `[0.4, 5.6]`. The outside
+/// is occupied. No cost inflation is applied: hard collision is the swept
+/// footprint alone.
+pub fn replan_corridor() -> RouteQuery {
+    let mut map = grid(6.0, 3.4, 0.10);
+    map.apply_aabb(
+        Point::new(0.0, 0.0),
+        Point::new(6.0, 0.8),
+        Occupancy::Occupied,
+    )
+    .expect("floor");
+    map.apply_aabb(
+        Point::new(0.0, 2.6),
+        Point::new(6.0, 3.4),
+        Occupancy::Occupied,
+    )
+    .expect("ceiling");
+    map.apply_aabb(
+        Point::new(0.0, 0.8),
+        Point::new(0.4, 2.6),
+        Occupancy::Occupied,
+    )
+    .expect("west wall");
+    map.apply_aabb(
+        Point::new(5.6, 0.8),
+        Point::new(6.0, 2.6),
+        Occupancy::Occupied,
+    )
+    .expect("east wall");
+    finish(&mut map);
+    query(
+        "replan corridor",
+        map,
+        Pose2d::new(0.9, 1.7, 0.0),
+        Pose2d::new(5.1, 1.7, 0.0),
+        example_model(),
+    )
+}
+
+/// Patch that blocks the straight corridor but leaves a gap along the ceiling.
+///
+/// The x range covers every cell column in `[2.4, 3.4]`, so a 0.1 m grid has
+/// no free slit beside the patch.
+pub fn replan_plug() -> (Point, Point) {
+    (Point::new(2.4, 0.8), Point::new(3.4, 1.9))
+}
+
+/// Patch that closes the corridor cross-section, including the boundary cells.
+pub fn replan_seal() -> (Point, Point) {
+    (Point::new(2.4, 0.8), Point::new(3.4, 2.6))
+}
+
+/// Patch inside the corridor, above the straight body, used to show a route
+/// that stays clear while its ticket still goes stale.
+pub fn replan_side_patch() -> (Point, Point) {
+    (Point::new(2.4, 2.35), Point::new(3.4, 2.55))
+}
+
+/// Short lane with a gap that a later patch can close.
+///
+/// The free band is small, so a search that has to prove the goal is
+/// unreachable finishes inside the default expansion budget.
+pub fn gate_lane() -> RouteQuery {
+    let mut map = grid(4.0, 2.4, 0.20);
+    map.apply_aabb(
+        Point::new(0.0, 0.0),
+        Point::new(4.0, 0.6),
+        Occupancy::Occupied,
+    )
+    .expect("floor");
+    map.apply_aabb(
+        Point::new(0.0, 1.8),
+        Point::new(4.0, 2.4),
+        Occupancy::Occupied,
+    )
+    .expect("ceiling");
+    finish(&mut map);
+    query(
+        "gate lane",
+        map,
+        Pose2d::new(0.7, 1.2, 0.0),
+        Pose2d::new(3.3, 1.2, 0.0),
+        example_model(),
+    )
+}
+
+/// Wall that closes [`gate_lane`], covering every cell column in the lane.
+pub fn gate_seal() -> (Point, Point) {
+    (Point::new(1.4, 0.6), Point::new(2.6, 1.8))
+}
+
 /// U-shaped course. `max_steering_angle` selects the minimum turning radius.
 ///
 /// The bulb is [`UTURN_BULB_WIDTH_M`] wide. Forward motion only is the right

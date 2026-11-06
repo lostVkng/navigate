@@ -87,6 +87,10 @@ pub struct GridMap {
     cost: Vec<f32>,
     distances_ready: bool,
     unknown_count: usize,
+    /// Opaque name of the frame the origin is measured in.
+    frame_id: String,
+    /// Occupancy-and-frame snapshot counter. See [`Self::revision`].
+    revision: u64,
 }
 
 impl GridMap {
@@ -132,7 +136,57 @@ impl GridMap {
             cost: vec![0.0; cells],
             distances_ready: false,
             unknown_count: 0,
+            frame_id: String::from("map"),
+            revision: 0,
         })
+    }
+
+    /// Opaque name of the coordinate frame `origin` is expressed in.
+    ///
+    /// The default is `"map"`. The grid does not interpret the string and does
+    /// not convert between frames. Two grids with the same cell data and
+    /// different names are different snapshots.
+    pub fn frame_id(&self) -> &str {
+        &self.frame_id
+    }
+
+    /// Rename the frame. An empty name is rejected and leaves the grid unchanged.
+    ///
+    /// A name that differs from the current one advances [`Self::revision`] by
+    /// one. Repeating the current name does not.
+    pub fn set_frame_id(&mut self, frame_id: impl Into<String>) -> Result<(), PathPlannerError> {
+        let frame_id = frame_id.into();
+        if frame_id.is_empty() {
+            return Err(PathPlannerError::InvalidConfiguration(
+                "grid frame id must be non-empty".into(),
+            ));
+        }
+        if frame_id == self.frame_id {
+            return Ok(());
+        }
+        self.frame_id = frame_id;
+        self.bump_revision();
+        Ok(())
+    }
+
+    /// Monotonic snapshot counter.
+    ///
+    /// A new grid starts at `0`. The counter advances by exactly one when a
+    /// mutating call changes at least one cell, or when [`Self::set_frame_id`]
+    /// changes the frame name. Writing the occupancy a cell already has does
+    /// not advance it. Recomputing the distance field or the cost layer does
+    /// not advance it: those layers are derived and do not change what the
+    /// swept footprint hits.
+    ///
+    /// There is no timestamp. Validity does not depend on wall-clock time or
+    /// on when a patch was applied. The counter saturates at [`u64::MAX`].
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// How many cells are [`Occupancy::Unknown`].
+    pub fn unknown_cells(&self) -> usize {
+        self.unknown_count
     }
 
     /// Number of columns.
@@ -193,8 +247,10 @@ impl GridMap {
 
     /// Replace the occupancy of one cell.
     ///
-    /// Invalidates the distance field. Out-of-range indexes return
-    /// [`PathPlannerError::OutOfBounds`].
+    /// Out-of-range indexes return [`PathPlannerError::OutOfBounds`] and do
+    /// not advance the revision. Writing the value the cell already holds
+    /// leaves the revision and the distance field unchanged. A real change
+    /// drops the distance field and advances [`Self::revision`] by one.
     pub fn set_occupancy(
         &mut self,
         ix: usize,
@@ -205,29 +261,62 @@ impl GridMap {
             return Err(PathPlannerError::OutOfBounds);
         }
         let index = iy * self.width + ix;
-        self.note_unknown_change(self.cells[index], occupancy);
-        self.cells[index] = occupancy;
-        self.distances_ready = false;
+        if self.write_cell(index, occupancy) {
+            self.bump_revision();
+        }
         Ok(())
     }
 
     /// Mark every cell whose center lies inside the axis-aligned rectangle as occupied.
     ///
-    /// Coordinates are in meters. Cells outside the grid are ignored.
+    /// Coordinates are in meters, in [`Self::frame_id`]. Cells outside the grid
+    /// are ignored. Non-finite or inverted bounds are ignored. Prefer
+    /// [`Self::apply_aabb`] when the caller needs to hear about those errors.
     pub fn set_aabb_occupied(&mut self, min: Point, max: Point) {
-        let (x0, y0) = self.clamp_cell_range(min.x, min.y, max.x, max.y);
-        for iy in y0.0..y0.1 {
-            for ix in x0.0..x0.1 {
+        let _ = self.apply_aabb(min, max, Occupancy::Occupied);
+    }
+
+    /// Paint every in-grid cell whose center lies inside the world AABB.
+    ///
+    /// Returns whether at least one cell changed. A change advances
+    /// [`Self::revision`] by one and drops the distance field. Painting the
+    /// occupancy a cell already has does not. Cells outside the grid are not
+    /// an error: out-of-map space stays blocked and cannot be marked free.
+    /// Non-finite coordinates, or a minimum greater than the maximum on either
+    /// axis, return [`PathPlannerError::InvalidConfiguration`] and do not
+    /// modify the grid.
+    pub fn apply_aabb(
+        &mut self,
+        min: Point,
+        max: Point,
+        occupancy: Occupancy,
+    ) -> Result<bool, PathPlannerError> {
+        if !min.x.is_finite() || !min.y.is_finite() || !max.x.is_finite() || !max.y.is_finite() {
+            return Err(PathPlannerError::InvalidConfiguration(
+                "occupancy patch bounds must be finite".into(),
+            ));
+        }
+        if min.x > max.x || min.y > max.y {
+            return Err(PathPlannerError::InvalidConfiguration(
+                "occupancy patch minimum exceeds its maximum".into(),
+            ));
+        }
+        let (xs, ys) = self.clamp_cell_range(min.x, min.y, max.x, max.y);
+        let mut changed = false;
+        for iy in ys.0..ys.1 {
+            for ix in xs.0..xs.1 {
                 let center = self.cell_center(ix, iy);
                 if center.0 >= min.x && center.0 <= max.x && center.1 >= min.y && center.1 <= max.y
                 {
                     let index = iy * self.width + ix;
-                    self.note_unknown_change(self.cells[index], Occupancy::Occupied);
-                    self.cells[index] = Occupancy::Occupied;
+                    changed |= self.write_cell(index, occupancy);
                 }
             }
         }
-        self.distances_ready = false;
+        if changed {
+            self.bump_revision();
+        }
+        Ok(changed)
     }
 
     /// Cell that contains the world point, if it lies inside the grid.
@@ -413,6 +502,20 @@ impl GridMap {
             || min_y < self.origin_y - EDGE
             || max_x > far_x + EDGE
             || max_y > far_y + EDGE
+    }
+
+    fn write_cell(&mut self, index: usize, occupancy: Occupancy) -> bool {
+        if self.cells[index] == occupancy {
+            return false;
+        }
+        self.note_unknown_change(self.cells[index], occupancy);
+        self.cells[index] = occupancy;
+        true
+    }
+
+    fn bump_revision(&mut self) {
+        self.distances_ready = false;
+        self.revision = self.revision.saturating_add(1);
     }
 
     fn note_unknown_change(&mut self, previous: Occupancy, next: Occupancy) {
@@ -711,5 +814,96 @@ mod tests {
         };
         let start = Pose2d::new(2.0, 2.0, 0.4);
         assert!(!map.sweep_in_collision(start, 0.7, 1.1, &body, 0.02));
+    }
+
+    #[test]
+    fn revision_advances_only_when_the_snapshot_changes() {
+        let mut map = open_map();
+        assert_eq!(map.revision(), 0);
+        assert_eq!(map.frame_id(), "map");
+        map.set_occupancy(1, 1, Occupancy::Occupied).unwrap();
+        assert_eq!(map.revision(), 1);
+        map.set_occupancy(1, 1, Occupancy::Occupied).unwrap();
+        assert_eq!(map.revision(), 1);
+        map.compute_distance_field().unwrap();
+        assert_eq!(map.revision(), 1);
+        assert!(map.distances_ready());
+        let changed = map
+            .apply_aabb(
+                Point::new(0.0, 0.0),
+                Point::new(0.4, 0.4),
+                Occupancy::Unknown,
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(map.revision(), 2);
+        assert!(!map.distances_ready());
+        assert!(map.unknown_cells() > 0);
+        let again = map
+            .apply_aabb(
+                Point::new(0.0, 0.0),
+                Point::new(0.4, 0.4),
+                Occupancy::Unknown,
+            )
+            .unwrap();
+        assert!(!again);
+        assert_eq!(map.revision(), 2);
+        map.set_frame_id("map").unwrap();
+        assert_eq!(map.revision(), 2);
+        map.set_frame_id("odom").unwrap();
+        assert_eq!(map.revision(), 3);
+        assert_eq!(map.frame_id(), "odom");
+        assert!(map.set_frame_id("").is_err());
+        assert_eq!(map.revision(), 3);
+        let before = map.revision();
+        let error = map
+            .apply_aabb(
+                Point::new(f64::NAN, 0.0),
+                Point::new(1.0, 1.0),
+                Occupancy::Free,
+            )
+            .unwrap_err();
+        assert!(matches!(error, PathPlannerError::InvalidConfiguration(_)));
+        assert_eq!(map.revision(), before);
+        let error = map
+            .apply_aabb(Point::new(2.0, 0.0), Point::new(1.0, 1.0), Occupancy::Free)
+            .unwrap_err();
+        assert!(matches!(error, PathPlannerError::InvalidConfiguration(_)));
+        let outside = map
+            .apply_aabb(
+                Point::new(-5.0, -5.0),
+                Point::new(-4.0, -4.0),
+                Occupancy::Free,
+            )
+            .unwrap();
+        assert!(!outside);
+        assert_eq!(map.revision(), before);
+    }
+
+    #[test]
+    fn origin_is_the_minimum_corner_and_the_far_edge_is_outside() {
+        let map = GridMap::new(4, 4, 0.5, 10.0, -2.0).unwrap();
+        assert_eq!(map.world_to_cell(10.0, -2.0), Some((0, 0)));
+        assert_eq!(map.world_to_cell(9.999, -2.0), None);
+        assert_eq!(map.world_to_cell(11.999, -2.0), Some((3, 0)));
+        assert_eq!(map.world_to_cell(12.0, -2.0), None);
+        let (x, y) = map.cell_center(0, 0);
+        assert!((x - 10.25).abs() < 1e-12);
+        assert!((y - (-1.75)).abs() < 1e-12);
+        let body = Footprint::Circle { radius: 0.2 };
+        assert!(map.in_collision(Pose2d::new(10.1, -1.9, 0.0), &body));
+        assert!(!map.in_collision(Pose2d::new(11.0, -1.0, 0.0), &body));
+        assert!(map.in_collision(Pose2d::new(20.0, 0.0, 0.0), &body));
+    }
+
+    #[test]
+    fn unknown_blocks_and_does_not_seed_the_distance_field() {
+        let mut map = open_map();
+        map.set_occupancy(4, 4, Occupancy::Unknown).unwrap();
+        map.compute_distance_field().unwrap();
+        assert_eq!(map.distance(4, 4), Some(f32::INFINITY));
+        let body = Footprint::Circle { radius: 0.05 };
+        let (x, y) = map.cell_center(4, 4);
+        assert!(map.in_collision(Pose2d::new(x, y, 0.0), &body));
     }
 }

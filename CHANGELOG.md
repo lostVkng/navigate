@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.2
+
+Offline occupancy snapshots and replanning on the existing swept hybrid-A* planner.
+
+- [`GridMap`] carries a `frame_id` (default `"map"`) and a `revision`. The
+  revision starts at 0 and advances by one when a cell actually changes or the
+  frame name changes. Repeating the same occupancy, and recomputing the
+  distance or cost layer, do not advance it. There is no timestamp.
+- [`GridMap::apply_aabb`] paints free, occupied, or unknown cells. Unknown
+  cells and anything outside the grid stay blocked. Out-of-map space cannot be
+  marked free.
+- [`plan_route`] / [`refresh_route`] stamp a [`RoutePlan`] for one
+  `(frame_id, revision, clearance)` triple. After the grid changes,
+  [`RoutePlan::validated_path`] is `None` until a refresh re-checks or
+  searches again. [`RouteRefresh::NoSafeRoute`] is the explicit blocked
+  result and is not a ticket.
+- `clearance` grows the footprint once. `sweep_tolerance` remains the
+  numerical sampling bound on that grown body. The cost-inflation layer is
+  not a second hard clearance.
+- `cargo test --test obstacle_replans` and `cargo run --release --example replan_demo`.
+
 ## 0.2.1
 
 Swept-footprint collision checks for the existing hybrid-A* planner, plus

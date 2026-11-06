@@ -2,8 +2,13 @@
 //!
 //! A [`GridMap`] is a row-major array of cells. The world frame is continuous:
 //! cell `(0, 0)` covers the square whose minimum corner is the grid origin, and
-//! each cell is `resolution` meters on a side. Planners query three related
-//! layers:
+//! each cell is `resolution` meters on a side. The origin is labeled with a
+//! `frame_id` string. That string is an opaque name, not a transform tree.
+//! Unknown cells and any query outside the grid are blocked. A `revision`
+//! counter advances when occupancy or the frame name changes, so a route
+//! checked against an older snapshot can be rejected.
+//!
+//! Planners query three related layers:
 //!
 //! * **occupancy** — free, occupied, or unknown;
 //! * **distance** — exact Euclidean distance in meters from each cell center to

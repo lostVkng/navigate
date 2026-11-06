@@ -24,6 +24,7 @@ pub use crate::motion::{
     dubins_length, dubins_path, reeds_shepp_length, reeds_shepp_path,
 };
 pub use crate::planning::{
-    HybridAStar, HybridAStarConfig, PathSmoother, PlannedPath, check_planned_path,
+    HybridAStar, HybridAStarConfig, PathSmoother, PlannedPath, RoutePlan, RouteRefresh,
+    RouteRequest, check_planned_path, plan_route, refresh_route,
 };
 pub use crate::sampling_algos::rrt_star::{Map, RRTStar};
