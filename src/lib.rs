@@ -9,7 +9,7 @@
 //! * [`grid`] — an occupancy grid, an exact Euclidean distance transform, and
 //!   distance-based cost inflation.
 //! * [`motion`] — a kinematic bicycle model, Dubins paths, and Reeds–Shepp paths.
-//! * [`planning`] — hybrid-A\* for a car-like robot, plus a shortcut smoother.
+//! * [`planning`] — hybrid-A\* for a car-like robot, swept-footprint checks, snapshot replanning, and a shortcut smoother.
 //! * [`control`] — regulated pure pursuit and model-predictive path-integral
 //!   control.
 //!

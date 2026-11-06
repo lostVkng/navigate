@@ -6,7 +6,7 @@
 mod footprint;
 mod pose;
 
-pub use footprint::Footprint;
+pub use footprint::{Footprint, sweep_half_chord, sweep_step_length};
 pub use pose::{Pose2d, angle_difference, wrap_to_pi};
 
 use num_traits::{Float, Num, Signed};
