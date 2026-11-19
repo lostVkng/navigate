@@ -6,9 +6,10 @@
 //! different type from [`GridMap`].
 
 pub use crate::control::{
-    ConstraintCritic, ControlSmoothnessCritic, Critic, GoalCritic, Mppi, MppiConfig, MppiOutput,
-    NoiseModel, ObstacleCritic, PathTrackingCritic, PurePursuit, PurePursuitConfig, Rollout,
-    VehicleCommand,
+    ConstraintCritic, ControlSmoothnessCritic, Critic, Disturbance, FollowConfig, FollowRequest,
+    GoalCritic, Mppi, MppiConfig, MppiOutput, NoiseModel, ObstacleCritic, PathTrackingCritic,
+    PurePursuit, PurePursuitConfig, Rollout, TrackingError, TrackingLimitKind, TrackingReport,
+    TrackingSample, TrackingTolerances, VehicleCommand, follow_route,
 };
 pub use crate::errors::{GeometryError, PathPlannerError, SearchLimitKind};
 pub use crate::geometry::{

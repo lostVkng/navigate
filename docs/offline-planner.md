@@ -165,7 +165,10 @@ does not prove the vehicle can stop.
 ## What this does not establish
 
 A feasible simulated route is not evidence that a physical vehicle can follow
-it, and it is not a safety proof.
+it, and it is not a safety proof. Tracking that route with the Stanley
+simulation is a separate check, described in [route-following.md](route-following.md).
+That check can reject a stale ticket and a plant that leaves the path. It
+still does not establish a stopping distance.
 
 Still uncalibrated, and intentionally not invented here:
 
