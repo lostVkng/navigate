@@ -68,6 +68,12 @@ pub enum PathPlannerError {
     StartInCollision,
     /// The goal pose is in collision, so no feasible path can end there.
     GoalInCollision,
+    /// A pose sequence breaks a kinematic or swept-collision constraint.
+    ///
+    /// The message names the constraint. This is a property of a candidate
+    /// route, distinct from [`Self::NoPathFound`], which means the search
+    /// itself did not reach the goal.
+    PathInfeasible(String),
     /// A failure that does not fit the variants above.
     Other(String),
 }
@@ -101,6 +107,7 @@ impl fmt::Display for PathPlannerError {
             PathPlannerError::OutOfBounds => write!(f, "query is outside the map bounds"),
             PathPlannerError::StartInCollision => write!(f, "the start pose is in collision"),
             PathPlannerError::GoalInCollision => write!(f, "the goal pose is in collision"),
+            PathPlannerError::PathInfeasible(msg) => write!(f, "path is infeasible: {msg}"),
             PathPlannerError::Other(msg) => write!(f, "{msg}"),
         }
     }

@@ -15,12 +15,17 @@ use crate::motion::{BicycleModel, CurvePath, dubins_path, reeds_shepp_path};
 /// Greedy shortcut smoother.
 #[derive(Clone, Debug)]
 pub struct PathSmoother {
-    /// Sample spacing used for collision checks and for the emitted polyline.
+    /// Spacing of the emitted polyline, in meters.
     pub spacing: f64,
     /// Use Reeds–Shepp shortcuts when `true`, Dubins shortcuts otherwise.
     pub allow_reverse: bool,
     /// Maximum shortcut passes. Each pass scans the current polyline once.
     pub passes: usize,
+    /// Half-chord tolerance, in meters, for the swept footprint test.
+    ///
+    /// Same meaning as [`crate::HybridAStarConfig::sweep_tolerance`]. A shortcut
+    /// that clears an obstacle by less than this may be rejected.
+    pub sweep_tolerance: f64,
 }
 
 impl Default for PathSmoother {
@@ -29,6 +34,7 @@ impl Default for PathSmoother {
             spacing: 0.25,
             allow_reverse: true,
             passes: 3,
+            sweep_tolerance: 0.02,
         }
     }
 }
@@ -48,6 +54,11 @@ impl PathSmoother {
         if !self.spacing.is_finite() || self.spacing <= 0.0 {
             return Err(PathPlannerError::InvalidConfiguration(
                 "smoother spacing must be finite and positive".into(),
+            ));
+        }
+        if !self.sweep_tolerance.is_finite() || self.sweep_tolerance <= 0.0 {
+            return Err(PathPlannerError::InvalidConfiguration(
+                "smoother sweep tolerance must be finite and positive".into(),
             ));
         }
         if poses.len() < 3 {
@@ -86,7 +97,7 @@ impl PathSmoother {
                 if path.length + 1e-3 >= subpath_length(poses, index, candidate) {
                     continue;
                 }
-                if hits(&path, poses[index], map, footprint, self.spacing) {
+                if hits(&path, poses[index], map, footprint, self.sweep_tolerance) {
                     continue;
                 }
                 landed = candidate;
@@ -120,21 +131,20 @@ fn hits(
     start: Pose2d,
     map: &GridMap,
     footprint: &Footprint,
-    spacing: f64,
+    sweep_tolerance: f64,
 ) -> bool {
     let mut pose = start;
     for segment in &path.segments {
-        let pieces = (segment.length.abs() / spacing).ceil().max(1.0) as usize;
-        if segment.length.abs() < 1e-12 {
-            continue;
+        if map.sweep_in_collision(
+            pose,
+            segment.curvature,
+            segment.length,
+            footprint,
+            sweep_tolerance,
+        ) {
+            return true;
         }
-        let piece = segment.length / pieces as f64;
-        for _ in 0..pieces {
-            pose = pose.advance(segment.curvature, piece);
-            if map.in_collision(pose, footprint) {
-                return true;
-            }
-        }
+        pose = pose.advance(segment.curvature, segment.length);
     }
     false
 }

@@ -44,8 +44,18 @@ pub struct HybridAStarConfig {
     /// Speed assumed when converting the steering-rate limit into a per-step
     /// change in steering angle. Meters per second.
     pub nominal_speed: f64,
-    /// Spacing used to collision-check and to emit the dense path, in meters.
+    /// Spacing used to emit the dense path and to integrate traversal cost, in
+    /// meters. Collision checks use [`Self::sweep_tolerance`] and may
+    /// subdivide further.
     pub sample_spacing: f64,
+    /// Largest half-chord gap, in meters, allowed while sweeping the footprint.
+    ///
+    /// Each arc is split until every footprint point moves at most twice this
+    /// distance between samples, then the footprint is enlarged by the actual
+    /// half-chord and tested. This is a numerical tolerance, not a calibrated
+    /// safety margin: a body that clears an obstacle by less than this value
+    /// may be rejected. Must be finite and positive.
+    pub sweep_tolerance: f64,
     /// Expansion and time budgets for the search.
     pub limits: SearchLimits,
 }
@@ -67,6 +77,7 @@ impl Default for HybridAStarConfig {
             goal_yaw_tolerance: 0.35,
             nominal_speed: 1.0,
             sample_spacing: 0.25,
+            sweep_tolerance: 0.02,
             limits: SearchLimits::none(),
         }
     }
@@ -101,6 +112,9 @@ impl HybridAStarConfig {
         }
         if self.nominal_speed == 0.0 || self.sample_spacing == 0.0 {
             return Err(bad("nominal_speed and sample_spacing must be positive"));
+        }
+        if !self.sweep_tolerance.is_finite() || self.sweep_tolerance <= 0.0 {
+            return Err(bad("sweep_tolerance must be finite and positive"));
         }
         Ok(())
     }
@@ -167,6 +181,10 @@ impl HybridAStar {
         footprint: &Footprint,
     ) -> Result<PlannedPath, PathPlannerError> {
         self.config.validate()?;
+        validate_footprint(footprint)?;
+        if !finite_pose(start) || !finite_pose(goal) {
+            return Err(bad("start and goal poses must be finite"));
+        }
         if map.in_collision(start, footprint) {
             return Err(PathPlannerError::StartInCollision);
         }
@@ -383,13 +401,12 @@ fn primitive_successors(
             }
             let length = direction * config.step_length;
             let curvature = model.curvature_from_steering(steering);
-            if !sweep_clear(
+            if map.sweep_in_collision(
                 state.pose,
                 curvature,
                 length,
-                map,
                 footprint,
-                config.sample_spacing,
+                config.sweep_tolerance,
             ) {
                 continue;
             }
@@ -443,7 +460,7 @@ fn analytic_successor(
     } else {
         dubins_path(state.pose, goal, radius)?
     };
-    if path_hits(&path, state.pose, map, footprint, config.sample_spacing) {
+    if path_hits(&path, state.pose, map, footprint, config.sweep_tolerance) {
         return None;
     }
     let mut cost = 0.0;
@@ -500,48 +517,63 @@ fn traversal_cost(
     cost
 }
 
-fn sweep_clear(
-    start: Pose2d,
-    curvature: f64,
-    length: f64,
-    map: &GridMap,
-    footprint: &Footprint,
-    spacing: f64,
-) -> bool {
-    let pieces = sample_count(length.abs(), spacing);
-    let piece = length / pieces as f64;
-    let mut pose = start;
-    for _ in 0..pieces {
-        pose = pose.advance(curvature, piece);
-        if map.in_collision(pose, footprint) {
-            return false;
-        }
-    }
-    true
-}
-
 fn path_hits(
     path: &CurvePath,
     start: Pose2d,
     map: &GridMap,
     footprint: &Footprint,
-    spacing: f64,
+    sweep_tolerance: f64,
 ) -> bool {
     let mut pose = start;
     for segment in &path.segments {
-        if !sweep_clear(
+        if map.sweep_in_collision(
             pose,
             segment.curvature,
             segment.length,
-            map,
             footprint,
-            spacing,
+            sweep_tolerance,
         ) {
             return true;
         }
         pose = pose.advance(segment.curvature, segment.length);
     }
     false
+}
+
+fn finite_pose(pose: Pose2d) -> bool {
+    pose.x.is_finite() && pose.y.is_finite() && pose.theta.is_finite()
+}
+
+fn validate_footprint(footprint: &Footprint) -> Result<(), PathPlannerError> {
+    match *footprint {
+        Footprint::Circle { radius } => {
+            if radius.is_finite() && radius >= 0.0 {
+                Ok(())
+            } else {
+                Err(bad("footprint radius must be finite and non-negative"))
+            }
+        }
+        Footprint::OrientedRectangle {
+            length,
+            width,
+            rear_overhang,
+        } => {
+            if length.is_finite()
+                && width.is_finite()
+                && rear_overhang.is_finite()
+                && length > 0.0
+                && width > 0.0
+                && rear_overhang >= 0.0
+                && rear_overhang <= length
+            {
+                Ok(())
+            } else {
+                Err(bad(
+                    "rectangular footprint must be finite and positive and contain the rear axle",
+                ))
+            }
+        }
+    }
 }
 
 fn sample_count(length: f64, spacing: f64) -> usize {
@@ -671,25 +703,14 @@ mod tests {
         }
     }
 
-    fn assert_feasible(path: &PlannedPath, model: &BicycleModel, map: &GridMap, body: &Footprint) {
-        assert!(path.poses.len() >= 2, "path was empty");
-        let mut pose = path.poses[0];
-        let max_kappa = model.max_curvature() + 1e-6;
-        for i in 1..path.poses.len() {
-            assert!(
-                path.curvature[i].abs() <= max_kappa,
-                "curvature {} exceeds {max_kappa}",
-                path.curvature[i]
-            );
-            pose = pose.advance(path.curvature[i], path.segment_length[i]);
-            let error = pose.distance(path.poses[i]);
-            assert!(error < 1e-6, "integration drift {error}");
-            assert!(
-                !map.in_collision(path.poses[i], body),
-                "collision at {:?}",
-                path.poses[i]
-            );
-        }
+    fn assert_feasible(
+        path: &PlannedPath,
+        goal: Pose2d,
+        model: &BicycleModel,
+        map: &GridMap,
+        body: &Footprint,
+    ) {
+        super::super::check_planned_path(path, goal, map, model, body, &config()).unwrap();
     }
 
     #[test]
@@ -704,7 +725,7 @@ mod tests {
         let second = planner.plan(start, goal, &map, &model, &body).unwrap();
         assert_eq!(first.poses.len(), second.poses.len());
         assert!((first.cost - second.cost).abs() < 1e-9);
-        assert_feasible(&first, &model, &map, &body);
+        assert_feasible(&first, goal, &model, &map, &body);
         let end = *first.poses.last().unwrap();
         assert!(end.distance(goal) <= config().goal_xy_tolerance + 1e-6);
         assert!(
@@ -734,7 +755,8 @@ mod tests {
                 &body,
             )
             .unwrap();
-        assert_feasible(&path, &model, &map, &body);
+        let goal = Pose2d::new(20.0, 5.0, 0.0);
+        assert_feasible(&path, goal, &model, &map, &body);
         assert!(
             path.poses.iter().any(|pose| pose.y > 12.0),
             "path did not clear the wall"
@@ -757,7 +779,8 @@ mod tests {
                 &body,
             )
             .unwrap();
-        assert_feasible(&path, &model, &map, &body);
+        let goal = Pose2d::new(4.0, 5.0, 0.0);
+        assert_feasible(&path, goal, &model, &map, &body);
         assert!(
             path.segment_length.iter().any(|length| *length < 0.0),
             "expected a reverse segment, length {}",

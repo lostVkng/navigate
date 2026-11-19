@@ -13,7 +13,7 @@ pub use crate::control::{
 pub use crate::errors::{GeometryError, PathPlannerError, SearchLimitKind};
 pub use crate::geometry::{
     Footprint, Point, Polygon, Pose2d, angle_difference, euclidean, manhattan_distance,
-    squared_euclidean, wrap_to_pi,
+    squared_euclidean, sweep_half_chord, sweep_step_length, wrap_to_pi,
 };
 pub use crate::graph_algos::{
     AStar, Dijkstra, GraphNodeMap, KeyedSearchResult, SearchCost, SearchLimits,
@@ -23,5 +23,8 @@ pub use crate::motion::{
     BicycleInput, BicycleModel, BicycleParams, BicycleState, CurvePath, CurveSegment,
     dubins_length, dubins_path, reeds_shepp_length, reeds_shepp_path,
 };
-pub use crate::planning::{HybridAStar, HybridAStarConfig, PathSmoother, PlannedPath};
+pub use crate::planning::{
+    HybridAStar, HybridAStarConfig, PathSmoother, PlannedPath, RoutePlan, RouteRefresh,
+    RouteRequest, check_planned_path, plan_route, refresh_route,
+};
 pub use crate::sampling_algos::rrt_star::{Map, RRTStar};
