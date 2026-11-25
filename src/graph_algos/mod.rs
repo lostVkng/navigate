@@ -5,7 +5,8 @@
 //! implementation. Ties break deterministically: equal `f` prefers the larger
 //! path cost `g` (the state the heuristic says is closer to the goal), then the
 //! earlier insertion. [`SearchLimits`] optionally stops the search after a
-//! number of expansions or a wall-clock duration.
+//! number of expansions or a wall-clock duration. For cooperative cancellation
+//! and explicit storage and iterator budgets, see [`bounded`].
 //!
 //! A* here is the Hart–Nilsson–Raphael algorithm (1968). With a zero heuristic
 //! it is Dijkstra's algorithm (1959). An admissible heuristic (one that never
@@ -18,6 +19,7 @@ mod limits;
 mod search;
 
 pub mod a_star;
+pub mod bounded;
 pub mod dijkstra;
 
 pub use a_star::AStar;

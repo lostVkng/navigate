@@ -36,6 +36,29 @@ use crate::geometry::{Footprint, Pose2d};
 use crate::grid::GridMap;
 use crate::motion::{BicycleModel, project_onto_path};
 
+/// Signed curvature of the circle from the rear axle to a lookahead point
+/// expressed in the vehicle frame (x forward, y left). A coincident or
+/// near-coincident point (distance below 0.1 mm) gives zero curvature.
+/// Returns curvature in inverse meters for coordinates in meters, or `None`
+/// for a nonfinite coordinate. The caller applies any reverse-travel sign.
+///
+/// ```
+/// use navigate::{control::pursuit_curvature, geometry::Point};
+/// let k = pursuit_curvature(Point::new(1.0, 1.0)).unwrap();
+/// assert!((k - 1.0).abs() < 1e-12);
+/// ```
+pub fn pursuit_curvature(target: crate::geometry::Point) -> Option<f64> {
+    if !target.x.is_finite() || !target.y.is_finite() {
+        return None;
+    }
+    // Half the chord length is representable even for two f64::MAX coordinates.
+    let half_distance = (0.5 * target.x).hypot(0.5 * target.y);
+    if half_distance < 0.00005 {
+        return Some(0.0);
+    }
+    Some((0.5 * target.y / half_distance) / half_distance)
+}
+
 /// Parameters of [`PurePursuit`].
 #[derive(Clone, Debug)]
 pub struct PurePursuitConfig {
@@ -81,6 +104,7 @@ impl Default for PurePursuitConfig {
 /// Geometric path tracker with regulated speed.
 #[derive(Clone, Debug)]
 pub struct PurePursuit {
+    /// Parameters supplied when constructing the planner or controller.
     config: PurePursuitConfig,
 }
 
@@ -138,11 +162,8 @@ impl PurePursuit {
         };
 
         let local = pose.inverse_transform_point(target.point);
-        let denom = local.x * local.x + local.y * local.y;
-        let mut curvature = if denom < 1e-8 {
-            0.0
-        } else {
-            2.0 * local.y / denom
+        let Some(mut curvature) = pursuit_curvature(local) else {
+            return VehicleCommand::stopped();
         };
         if target.reverse {
             curvature = -curvature;
@@ -216,15 +237,20 @@ impl PurePursuit {
     }
 }
 
+/// Construct a configuration error for an invalid tracker parameter.
 fn bad(message: &str) -> PathPlannerError {
     PathPlannerError::InvalidConfiguration(message.into())
 }
 
+/// Point selected ahead on the path and its direction of travel.
 struct Lookahead {
+    /// Position in map coordinates.
     point: crate::geometry::Point,
+    /// Whether the vehicle traverses this segment in reverse.
     reverse: bool,
 }
 
+/// Walk from the projected segment until the requested lookahead distance is reached.
 fn lookahead_point(
     path: &[Pose2d],
     mut segment: usize,
@@ -253,6 +279,7 @@ fn lookahead_point(
     })
 }
 
+/// Interpolate the position between consecutive reference poses.
 fn interpolate(start: Pose2d, end: Pose2d, fraction: f64) -> crate::geometry::Point {
     crate::geometry::Point::new(
         start.x + fraction * (end.x - start.x),
@@ -260,11 +287,13 @@ fn interpolate(start: Pose2d, end: Pose2d, fraction: f64) -> crate::geometry::Po
     )
 }
 
+/// Infer reverse travel from segment displacement relative to the initial heading.
 fn segment_is_reverse(start: Pose2d, end: Pose2d) -> bool {
     let travel = (end.y - start.y).atan2(end.x - start.x);
     crate::geometry::angle_difference(travel, start.theta).abs() > std::f64::consts::FRAC_PI_2
 }
 
+/// Reduce forward speed for curvature, obstacle proximity and goal approach.
 fn regulate_speed(
     config: &PurePursuitConfig,
     curvature: f64,
@@ -293,6 +322,7 @@ fn regulate_speed(
     speed.max(0.0)
 }
 
+/// Estimate obstacle clearance around the vehicle reference point.
 fn obstacle_clearance(map: &GridMap, pose: Pose2d, footprint: &Footprint) -> Option<f64> {
     let distance = map.distance_at(pose.x, pose.y)?;
     if !distance.is_finite() {
@@ -301,6 +331,7 @@ fn obstacle_clearance(map: &GridMap, pose: Pose2d, footprint: &Footprint) -> Opt
     Some((f64::from(distance) - footprint.inscribed_radius()).max(0.0))
 }
 
+/// Check the projected commanded arc over the collision horizon.
 fn arc_collides(
     pose: Pose2d,
     curvature: f64,

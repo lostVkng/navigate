@@ -27,4 +27,4 @@ pub use follow::{
     TrackingSample, TrackingTolerances, follow_route,
 };
 pub use mppi::{Mppi, MppiConfig, MppiOutput, NoiseModel};
-pub use pure_pursuit::{PurePursuit, PurePursuitConfig};
+pub use pure_pursuit::{PurePursuit, PurePursuitConfig, pursuit_curvature};
